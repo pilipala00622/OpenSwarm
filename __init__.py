@@ -1,0 +1,121 @@
+"""Open Swarm - Multi-Agent Rollout Framework
+
+A lightweight, extensible framework for orchestrating multiple AI agents
+to collaboratively solve complex tasks.
+
+Features (v0.3.0 — aligned with Oh-My-OpenCode):
+- Category system for task-specific agent profiles
+- Tool permission control (blacklist / whitelist)
+- Background task execution and retrieval
+- Task dependency tracking with automatic parallel scheduling
+- Handoff mechanism for cross-session continuity
+- External memory with LLM summarisation
+- Structured execution tracing
+
+Example:
+    from open_swarm import Agent, AgentConfig, MainRollout, RolloutConfig
+    from open_swarm import CategoryRegistry, TaskStore, HandoffManager
+    from open_swarm.tool import SearchTool, VerifyTool
+    from open_swarm.swarm_tool import (
+        CreateSubagentTool, TaskTool,
+        BackgroundOutputTool, BackgroundCancelTool,
+        TaskCreateTool, TaskListTool, TaskUpdateTool, TaskGetTool,
+        HandoffTool,
+    )
+
+    # Setup
+    agent_registry = {}
+    category_registry = CategoryRegistry()
+    task_store = TaskStore()
+
+    # Create tools
+    task_tool = TaskTool(agent_registry, category_registry=category_registry, task_store=task_store)
+    bg_output = BackgroundOutputTool(task_tool)
+    bg_cancel = BackgroundCancelTool(task_tool)
+
+    # Create agent with category-based delegation
+    config = AgentConfig(name="main", system_prompt="You are an orchestrator.")
+    agent = Agent(config, tools=[search, task_tool, bg_output, bg_cancel])
+
+    # Run
+    rollout = MainRollout(RolloutConfig(max_steps=30))
+    result = await rollout.run(agent, "Research AI safety with parallel sub-agents")
+"""
+
+from .agent import Agent, AgentConfig
+from .rollout import (
+    BaseRollout,
+    MainRollout,
+    SubRollout,
+    SubRolloutConfig,
+    RolloutConfig,
+    RolloutResult,
+    RolloutStatus,
+)
+from .tool import BaseTool, ToolResult, SearchTool, VerifyTool
+from .swarm_tool import (
+    CreateSubagentTool,
+    TaskTool,
+    BackgroundOutputTool,
+    BackgroundCancelTool,
+    TaskCreateTool,
+    TaskGetTool,
+    TaskListTool,
+    TaskUpdateTool,
+    HandoffTool,
+)
+from .utils import (
+    LLMClient,
+    AgentMemory,
+    RolloutTracer,
+    CategoryRegistry,
+    CategoryConfig,
+    BUILTIN_CATEGORIES,
+    TaskStore,
+    Task,
+    HandoffManager,
+    HandoffDocument,
+)
+
+__version__ = "0.3.0"
+__author__ = "Open Swarm Contributors"
+
+__all__ = [
+    # Agent
+    "Agent",
+    "AgentConfig",
+    # Rollout
+    "BaseRollout",
+    "MainRollout",
+    "SubRollout",
+    "SubRolloutConfig",
+    "RolloutConfig",
+    "RolloutResult",
+    "RolloutStatus",
+    # Tool
+    "BaseTool",
+    "ToolResult",
+    "SearchTool",
+    "VerifyTool",
+    # Swarm Tools
+    "CreateSubagentTool",
+    "TaskTool",
+    "BackgroundOutputTool",
+    "BackgroundCancelTool",
+    "TaskCreateTool",
+    "TaskGetTool",
+    "TaskListTool",
+    "TaskUpdateTool",
+    "HandoffTool",
+    # Utils
+    "LLMClient",
+    "AgentMemory",
+    "RolloutTracer",
+    "CategoryRegistry",
+    "CategoryConfig",
+    "BUILTIN_CATEGORIES",
+    "TaskStore",
+    "Task",
+    "HandoffManager",
+    "HandoffDocument",
+]

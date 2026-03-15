@@ -19,9 +19,13 @@ import os
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+def _utcnow_iso() -> str:
+    """Get current UTC time as ISO string (Fix #16: avoid deprecated utcnow())."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -106,10 +110,16 @@ class TaskStore:
         logger.info(f"TaskStore: loaded {len(self._tasks)} tasks from {self.store_dir}")
 
     def _save_task(self, task: Task):
-        """Save a single task to disk."""
+        """Save a single task to disk.
+
+        Fix #6: Uses atomic write (write to temp file then rename) to prevent
+        corruption from crashes or concurrent writes.
+        """
         filepath = self._task_path(task.id)
-        with open(filepath, "w", encoding="utf-8") as f:
+        tmp_path = filepath + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(task.to_dict(), f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, filepath)  # atomic on POSIX
 
     def create(
         self,
@@ -130,16 +140,34 @@ class TaskStore:
 
         Returns:
             The created Task.
+
+        Raises:
+            ValueError: If blocked_by would create a dependency cycle (Fix #7).
         """
         task_id = f"T-{uuid.uuid4().hex[:8]}"
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_iso()
+
+        # Fix #7: Validate blocked_by references exist
+        resolved_blockers = []
+        for bid in (blocked_by or []):
+            if bid not in self._tasks:
+                logger.warning(f"Blocker task {bid} not found, ignoring")
+            else:
+                resolved_blockers.append(bid)
+
+        # Fix #7: Check for dependency cycles
+        if resolved_blockers and self._would_create_cycle(task_id, resolved_blockers):
+            raise ValueError(
+                f"Cannot create task {task_id}: blocked_by={resolved_blockers} "
+                f"would create a dependency cycle"
+            )
 
         task = Task(
             id=task_id,
             subject=subject,
             description=description,
             status="pending",
-            blocked_by=blocked_by or [],
+            blocked_by=resolved_blockers,
             owner=owner,
             metadata=metadata or {},
             created_at=now,
@@ -158,6 +186,26 @@ class TaskStore:
         self._save_task(task)
         logger.info(f"Task created: {task_id} - {subject}")
         return task
+
+    def _would_create_cycle(self, new_task_id: str, blocked_by: List[str]) -> bool:
+        """Check if adding blocked_by edges would create a dependency cycle (Fix #7).
+
+        Uses DFS: starting from each blocker, walk its blocker chain;
+        if we ever reach new_task_id, there's a cycle.
+        """
+        visited = set()
+        stack = list(blocked_by)
+        while stack:
+            current = stack.pop()
+            if current == new_task_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            task = self._tasks.get(current)
+            if task:
+                stack.extend(task.blocked_by)
+        return False
 
     def get(self, task_id: str) -> Optional[Task]:
         """Get a task by ID."""
@@ -191,7 +239,7 @@ class TaskStore:
             logger.warning(f"Task not found: {task_id}")
             return None
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_iso()
         task.updated_at = now
 
         if status:

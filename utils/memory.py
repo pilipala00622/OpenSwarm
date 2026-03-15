@@ -123,6 +123,10 @@ class AgentMemory:
     # Public API
     # ------------------------------------------------------------------
 
+    def set_llm_client(self, llm_client: "LLMClient"):
+        """Set the LLM client for summarisation (Fix #17: public setter)."""
+        self._llm_client = llm_client
+
     def should_compress(self, messages: List[Dict[str, Any]]) -> bool:
         """Check whether the message list is long enough to warrant compression."""
         return len(messages) > self.max_context_messages
@@ -201,17 +205,18 @@ class AgentMemory:
         return self._heuristic_summarise(messages)
 
     async def _llm_summarise(self, messages: List[Dict[str, Any]]) -> str:
-        """Use the LLM to generate a high-quality summary of the messages."""
+        """Use the LLM to generate a high-quality summary of the messages.
+
+        Fix #5: Uses model parameter override instead of mutating shared llm_client.model_id.
+        """
         try:
             # Serialise messages into a readable block for the prompt
             conversation_text = self._messages_to_text(messages)
 
             prompt = _SUMMARISE_PROMPT.format(conversation=conversation_text)
 
-            # Use a lower temperature for factual summarisation
+            # Fix #5: Use model= parameter instead of mutating shared client state
             model_override = self._summarise_model or self._llm_client.model_id
-            original_model = self._llm_client.model_id
-            self._llm_client.model_id = model_override
 
             response = await self._llm_client.chat(
                 messages=[
@@ -220,10 +225,8 @@ class AgentMemory:
                 ],
                 temperature=0.3,
                 max_tokens=1024,
+                model=model_override,
             )
-
-            # Restore model
-            self._llm_client.model_id = original_model
 
             summary = (response.get("content") or "").strip()
             if summary:

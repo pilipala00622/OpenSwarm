@@ -1,4 +1,4 @@
-# OpenSwarm — 多智能体编排框架 v0.3.0
+# OpenSwarm — 多智能体编排框架 v0.3.1
 
 > 一个轻量级、可扩展的多 AI 智能体协作框架，对齐 Oh-My-OpenCode 核心功能。  
 
@@ -7,6 +7,7 @@
 ## 目录
 
 - [项目概览](#项目概览)
+- [v0.3.1 更新日志](#v031-更新日志)
 - [项目结构](#项目结构)
 - [安装与运行](#安装与运行)
 - [核心概念](#核心概念)
@@ -20,6 +21,11 @@
   - [4. Task 依赖系统](#4-task-依赖系统)
   - [5. Handoff 跨会话交接](#5-handoff-跨会话交接)
   - [6. 外部记忆与上下文压缩](#6-外部记忆与上下文压缩)
+- [可靠性与可观测性](#可靠性与可观测性)
+  - [并发控制与限流](#并发控制与限流)
+  - [子 Agent 超时控制](#子-agent-超时控制)
+  - [Token 用量统计](#token-用量统计)
+  - [Graceful Shutdown](#graceful-shutdown)
 - [执行追踪 (Tracing)](#执行追踪-tracing)
 - [错误恢复与 Checkpoint](#错误恢复与-checkpoint)
 - [动态 Scaling Rules](#动态-scaling-rules)
@@ -27,25 +33,93 @@
   - [AgentConfig](#agentconfig)
   - [RolloutConfig](#rolloutconfig)
   - [SubRolloutConfig](#subrolloutconfig)
+  - [TaskTool 配置](#tasktool-配置)
 - [自定义工具](#自定义工具)
 - [完整示例](#完整示例)
 - [存储格式](#存储格式)
+- [已知限制与 TODO](#已知限制与-todo)
 - [声明](#声明)
 
 ---
 
 ## 项目概览
 
-Open Swarm 是一个多智能体编排框架，主 Agent 通过创建子 Agent 并分派任务来协作完成复杂工作。v0.3.0 对齐了 Oh-My-OpenCode 的核心功能集，新增 6 大能力：
+Open Swarm 是一个多智能体编排框架，主 Agent 通过创建子 Agent 并分派任务来协作完成复杂工作。v0.3.0 对齐了 Oh-My-OpenCode 的核心功能集，v0.3.1 进行了全面的可靠性加固，修复了 22 个问题（含 3 个 Critical），新增并发控制、超时、Token 统计等生产就绪能力。
+
+**六大核心功能**：
 
 | 功能 | 说明 |
 |---|---|
 | **Category System** | 8 种内置任务类别，每种映射到不同的模型/温度/推理强度 |
 | **Tool 权限控制** | 黑名单、白名单、禁止委派三层工具访问控制 |
 | **后台任务** | 异步启动子 Agent，主 Agent 不阻塞，稍后获取结果 |
-| **Task 依赖** | 任务间 blockedBy/blocks 依赖关系，自动并行调度 |
-| **Handoff** | 跨会话上下文交接，在新 session 中续传工作状态 |
+| **Task 依赖** | 任务间 blockedBy/blocks 依赖关系，自动并行调度，含环检测 |
+| **Handoff** | 跨会话上下文交接，自动提取已完成/待完成工作 |
 | **外部记忆** | Anthropic 风格的 LLM 摘要 + 文件持久化上下文压缩 |
+
+**v0.3.1 新增能力**：
+
+| 能力 | 说明 |
+|---|---|
+| **并发限流** | `asyncio.Semaphore` 控制子 Agent 最大并发数（默认 10） |
+| **子 Agent 超时** | `asyncio.wait_for` 对单个子任务施加总时长限制 |
+| **Token 统计** | LLM 调用自动采集 prompt/completion/total tokens，Tracer 汇总输出 |
+| **原子写入** | TaskStore 使用 write-to-tmp + `os.replace` 防止文件损坏 |
+| **Graceful Shutdown** | `interrupt()` 时自动取消所有后台任务 |
+
+---
+
+## v0.3.1 更新日志
+
+> 2026-03-15 — 全面可靠性加固，修复 22 个问题（3 Critical / 4 High / 6 Medium / 4 Low / 5 Arch），2 个标记 TODO。
+
+### Critical 修复
+
+| 修复 | 说明 |
+|---|---|
+| **Category 模型生效** | 子 Agent 不再无条件复用父 Agent 的 LLM Client。当 Category 指定的 model/api_key/base_url 与父 Agent 不同时，自动创建独立 `LLMClient` 实例 |
+| **LLM 重试全挂抛异常** | `LLMClient.chat()` 三次重试全部失败后不再伪装成正常回复，改为抛出 `RuntimeError`；Rollout 循环进入错误恢复流程 |
+| **空回复防护** | 新增 `_is_empty_response()` 检测，空回复时注入系统提示要求 LLM 重新作答，避免空转到 max_steps |
+
+### High 修复
+
+| 修复 | 说明 |
+|---|---|
+| **并发竞态保护** | `subagent_counter` 改为 `itertools.count()`，共享状态加 `asyncio.Lock` |
+| **Memory 线程安全** | `_llm_summarise` 使用 `model=` 参数覆盖而非修改共享 `llm_client.model_id` |
+| **TaskStore 原子写入** | `_save_task` 改为 write-to-tmp + `os.replace`，防止进程崩溃导致 JSON 损坏 |
+| **依赖环检测** | `TaskStore.create()` 新增 DFS 环检测，循环依赖抛 `ValueError` |
+
+### Medium 修复
+
+| 修复 | 说明 |
+|---|---|
+| **配置字段透传** | `top_p` / `reasoning_effort` / `thinking_budget` 现在从 AgentConfig 正确传递到 LLM API |
+| **fork_context 快照** | 并行 tool calls 前快照父消息列表，确保所有子 Agent 看到相同上下文 |
+| **CancelledError 捕获** | 后台任务回调兼容 Python 3.9+ 的 `asyncio.CancelledError`（继承自 `BaseException`） |
+| **Handoff 工作提取** | `create()` 从 tasks 快照自动推断 completed_work / remaining_work |
+| **JSON 解析错误反馈** | 工具参数 JSON 解析失败时返回明确错误 ToolResult，不再静默传空参数 |
+| **CreateSubagent overwrite** | 新增 `overwrite` 参数支持更新已有子 Agent 配置 |
+
+### Low 修复
+
+- Checkpoint 列表限制上限 3 个，避免内存膨胀
+- `_save_result` 修复相对路径边缘 case
+- `datetime.utcnow()` 迁移到 `datetime.now(UTC)`（Python 3.12+ 兼容）
+- `AgentMemory` 提供 `set_llm_client()` 公开方法，不再直接访问私有属性
+
+### 架构增强
+
+- **子 Agent 超时**：`_run_subtask` 使用 `asyncio.wait_for(coro, timeout=subtask_timeout)`
+- **Token 统计**：`LLMClient` 返回 `usage`，`RolloutTracer` 汇总，终端输出 prompt/completion/total tokens
+- **并发限流**：`asyncio.Semaphore(max_concurrent_subagents=10)` 控制最大并发子 Agent 数
+- **结果质量标记**：`max_steps_reached` 结果加 `[WARNING]` 前缀
+- **Graceful Shutdown**：`interrupt()` 自动 `cancel_all_background()` 取消后台任务
+
+### TODO（待后续版本完成）
+
+- **Handoff 消息历史注入**：load 操作应将 `context_messages` 注入 Rollout 消息历史，需设计 tool→rollout 回调机制
+- **Agent Registry 持久化**：`CreateSubagentTool` 创建的 agent 配置需持久化到文件，以配合 Handoff 跨会话恢复
 
 ---
 
@@ -183,7 +257,7 @@ result = await rollout.run(agent, "分析最新的 AI 发展趋势")
 | `search` | `SearchTool` | Serper API 网络搜索 |
 | `code_runner` | `CodeRunnerTool` | Python/JavaScript 代码沙盒执行 |
 | `verify_result` | `VerifyTool` | 使用 LLM 交叉验证事实 |
-| `create_subagent` | `CreateSubagentTool` | 动态创建子 Agent 配置 |
+| `create_subagent` | `CreateSubagentTool` | 动态创建子 Agent 配置（支持 `overwrite` 更新） |
 | `assign_task` | `TaskTool` | 分派任务给子 Agent（核心） |
 | `background_output` | `BackgroundOutputTool` | 获取后台任务结果 |
 | `background_cancel` | `BackgroundCancelTool` | 取消后台任务 |
@@ -331,8 +405,9 @@ Tool 'code_runner' is blocked for this agent
 
 **技术实现**：
 - 使用 `asyncio.create_task()` 创建异步任务
-- `add_done_callback()` 自动在任务完成时收集结果
-- 结果存储在 `TaskTool._background_results` 字典中
+- `add_done_callback()` 自动在任务完成时收集结果（兼容 Python 3.9+ `CancelledError`）
+- 结果存储在 `TaskTool._background_results` 字典中，访问受 `asyncio.Lock` 保护
+- Graceful Shutdown：`interrupt()` 时自动 `cancel_all_background()` 取消所有后台任务
 
 ---
 
@@ -383,7 +458,9 @@ store.update(t2.id, status="completed")
 ready = store.get_ready_tasks()  # → [t3]
 ```
 
-**持久化**：任务以 JSON 文件存储在配置目录中（默认 `.agent_tasks/`），支持跨进程、跨会话持续存在。
+**持久化**：任务以 JSON 文件存储在配置目录中（默认 `.agent_tasks/`），使用 write-to-tmp + `os.replace` 原子写入，支持跨进程、跨会话持续存在。
+
+**依赖环检测**：`create()` 方法内置 DFS 环检测，循环依赖（如 A → B → A）会被即时拒绝并抛出 `ValueError`。
 
 **4 个 CRUD 工具**：
 
@@ -407,8 +484,8 @@ ready = store.get_ready_tasks()  # → [t3]
 | `id` | 唯一标识，格式 `H-YYYYMMDD_HHMMSS_{uuid6}` |
 | `agent_name` | 创建交接的 Agent 名称 |
 | `summary` | LLM 生成或启发式提取的工作摘要 |
-| `completed_work` | 已完成的工作列表 |
-| `remaining_work` | 待完成的工作列表 |
+| `completed_work` | 已完成的工作列表（自动从 tasks 快照提取） |
+| `remaining_work` | 待完成的工作列表（自动从 tasks 快照提取） |
 | `key_files` | 相关文件路径列表（自动从消息中提取） |
 | `key_decisions` | 会话中做出的重要决策 |
 | `context_messages` | 压缩的消息历史（system + 最近 20 条） |
@@ -486,6 +563,8 @@ handoff(action="list")
 - 不超过 400 词
 - 使用对话中的主要语言
 
+> **v0.3.1 线程安全改进**：LLM 摘要不再临时修改共享 `LLMClient` 的 `model_id`，而是通过 `model=` 参数覆盖传递，避免并发协程间的状态污染。
+
 **配置项**：
 
 | 参数 | 默认值 | 说明 |
@@ -495,6 +574,55 @@ handoff(action="list")
 | `memory_keep_recent` | 20 | 压缩时保留最近多少条消息 |
 | `memory_dir` | `.agent_memory/` | 记忆文件存储目录 |
 | `enable_llm_summarise` | True | 是否使用 LLM 生成摘要 |
+
+---
+
+## 可靠性与可观测性
+
+v0.3.1 新增一系列生产就绪能力，提升系统在真实部署中的稳定性。
+
+### 并发控制与限流
+
+Scaling Rules 是文本 prompt，靠 LLM 自觉遵守。为防止 LLM 在单个 turn 中发起过多并发子任务，`TaskTool` 内置硬性限流：
+
+```python
+task_tool = TaskTool(
+    agent_registry=agent_registry,
+    max_concurrent_subagents=10,   # asyncio.Semaphore 限流，默认 10
+    ...
+)
+```
+
+超出限制的子任务会排队等待，而非被拒绝。同时所有共享状态访问受 `asyncio.Lock` 保护，消除并发竞态。
+
+### 子 Agent 超时控制
+
+防止子 Agent 卡死或陷入死循环：
+
+```python
+task_tool = TaskTool(
+    agent_registry=agent_registry,
+    subtask_timeout=300.0,   # 单个子任务最多 300 秒，默认 None（无限制）
+    ...
+)
+```
+
+超时触发 `asyncio.TimeoutError`，子任务返回超时错误结果。
+
+### Token 用量统计
+
+`LLMClient.chat()` 自动从 API 响应中提取 `usage` 数据（prompt_tokens / completion_tokens / total_tokens），通过 `RolloutTracer` 汇总，终端模式下自动输出：
+
+```
+[Token Usage] Prompt: 45,200 | Completion: 8,600 | Total: 53,800
+```
+
+### Graceful Shutdown
+
+当 `MainRollout.interrupt()` 被调用时：
+1. 设置中断标志，下一个循环迭代终止
+2. 查找 `assign_task` 工具，调用 `cancel_all_background()` 取消所有后台任务
+3. 记录取消数量到 Tracer
 
 ---
 
@@ -510,6 +638,7 @@ handoff(action="list")
 | `tool_exec` | 每次工具执行 |
 | `subagent_spawn` | 子 Agent 启动 |
 | `subagent_complete` | 子 Agent 完成 |
+| `token_usage` | LLM 调用返回 token 用量（prompt / completion / total） |
 | `error` | 发生错误 |
 | `recovery` | 错误恢复（checkpoint 恢复、重试） |
 | `checkpoint` | 保存检查点 |
@@ -519,6 +648,7 @@ handoff(action="list")
 
 ```json
 {"ts": 0.123, "type": "llm_call", "agent": "orchestrator", "step": 0, "model": "kimi-k2.5", "message_count": 3}
+{"ts": 0.124, "type": "token_usage", "agent": "orchestrator", "prompt_tokens": 1520, "completion_tokens": 340, "total_tokens": 1860}
 {"ts": 1.456, "type": "tool_exec", "agent": "orchestrator", "step": 0, "tool": "search"}
 {"ts": 2.789, "type": "subagent_spawn", "agent": "orchestrator", "step": 1, "subagent_id": "subagent_1"}
 ```
@@ -534,6 +664,9 @@ summary = tracer.summary()
 #   "tool_executions": 8,
 #   "subagents_spawned": 3,
 #   "errors": 1,
+#   "prompt_tokens": 45200,
+#   "completion_tokens": 8600,
+#   "total_tokens": 53800,
 #   "tool_usage_breakdown": {"search": 3, "verify_result": 2, "assign_task": 3}
 # }
 ```
@@ -565,7 +698,14 @@ MainRollout 和 SubRollout 都实现了自动错误恢复机制：
 
 - 每隔 `checkpoint_interval` 步（默认 10）自动保存
 - 保存完整消息快照（deepcopy）
+- **最多保留 3 个 checkpoint**（Ring Buffer 模式），防止内存膨胀
 - 恢复时注入系统提示"Multiple consecutive errors occurred. State has been restored."
+
+**增强的错误检测**（v0.3.1）：
+
+- **LLM 重试全挂**：`LLMClient.chat()` 三次重试失败后抛出 `RuntimeError`，Rollout 进入错误恢复流程
+- **空回复检测**：`_is_empty_response()` 识别无内容无工具调用的响应，注入提示要求重新作答
+- **错误响应识别**：`_is_complete()` 检查 `finish_reason == "error"`，不再误判为正常完成
 
 ---
 
@@ -643,6 +783,19 @@ MainRollout 默认在系统提示词中注入资源分配规则：
 | `max_consecutive_errors` | 2 | 更低容忍度 |
 | `checkpoint_interval` | 0 | 默认禁用 |
 
+### TaskTool 配置
+
+`TaskTool` 构造函数参数（v0.3.1 新增）：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `agent_registry` | dict | 必填 | Agent 配置注册表 |
+| `max_steps` | int | 20 | 子 Agent 默认最大步数 |
+| `category_registry` | CategoryRegistry | None | 任务类别注册表 |
+| `task_store` | TaskStore | None | 持久化任务管理器 |
+| `max_concurrent_subagents` | int | 10 | 最大并发子 Agent 数（Semaphore 限流） |
+| `subtask_timeout` | float | None | 单个子任务超时秒数（None = 无限制） |
+
 ---
 
 ## 自定义工具
@@ -718,6 +871,8 @@ async def main():
         max_steps=15,
         category_registry=category_registry,
         task_store=task_store,
+        max_concurrent_subagents=10,     # v0.3.1: 并发限流
+        subtask_timeout=300.0,           # v0.3.1: 子任务超时 5 分钟
     )
     bg_output = BackgroundOutputTool(task_tool)
     bg_cancel = BackgroundCancelTool(task_tool)
@@ -833,19 +988,24 @@ asyncio.run(main())
 │           ┌────────────┼────────────┐                 │
 │           ▼            ▼            ▼                 │
 │       LLM 推理   → 工具调用    → 完成检测             │
-│           │            │                              │
+│           │            │            (含空回复/         │
+│           │            │             错误响应检测)     │
 │           │     ┌──────┼──────┬──────┐               │
 │           │     ▼      ▼      ▼      ▼               │
 │           │  search  verify  assign_task  task_create │
 │           │                    │                      │
+│           │        [消息快照 snapshot_parent_messages] │
 │           │              ┌─────┴─────┐                │
 │           │              ▼           ▼                │
 │           │         同步执行    后台执行               │
 │           │              │           │                │
-│           │      ┌───────┘     ┌─────┘                │
+│           │       [Semaphore 限流]   │                │
+│           │       [wait_for 超时]    │                │
+│           │              │     ┌─────┘                │
+│           │      ┌───────┘     │                      │
 │           │      ▼             ▼                      │
 │           │  SubRollout   asyncio.Task               │
-│           │      │             │                      │
+│           │      │         (Lock 保护结果)            │
 │           │      ▼             ▼                      │
 │           │   子 Agent      background_output         │
 │           │   返回结果      获取结果                    │
@@ -854,12 +1014,15 @@ asyncio.run(main())
 │    ┌──────────────┐   ┌──────────────┐               │
 │    │  Checkpoint   │   │   Memory     │               │
 │    │  每 N 步保存   │   │  超限时压缩   │               │
+│    │  (最多保留 3)  │   │              │               │
 │    └──────────────┘   └──────────────┘               │
 │                        │                              │
 │                        ▼                              │
-│              ┌──────────────────┐                     │
-│              │  Tracer 事件记录  │                     │
-│              └──────────────────┘                     │
+│      ┌──────────────────────────────────┐             │
+│      │  Tracer 事件记录 + Token 用量统计  │             │
+│      └──────────────────────────────────┘             │
+│                        │                              │
+│           [interrupt() → cancel_all_background()]     │
 └──────────────────────────────────────────────────────┘
     │
     ▼
@@ -872,8 +1035,17 @@ asyncio.run(main())
 
 ---
 
+## 已知限制与 TODO
+
+| 编号 | 说明 | 状态 |
+|:---:|------|:---:|
+| #22 | **Handoff 消息历史注入**：`load` 操作目前只返回格式化文本，不会将 `context_messages` 真正注入到 Rollout 消息历史。需设计 tool → rollout 回调机制。 | TODO |
+| #24 | **Agent Registry 持久化**：`CreateSubagentTool` 创建的 agent 配置仅存在内存中，跨会话 Handoff 恢复后丢失。需设计文件持久化格式或在 Handoff 中保存 registry 快照。 | TODO |
+
+---
+
 ## 声明
 
-本仓库是**个人性质的实验性项目**，仅用于 demo / 参考实现，并非生产可用系统。并发控制、成本控制等真实部署所需的功能未系统性处理。项目不代表任何公司或官方产品的立场。
+本仓库是**个人性质的实验性项目**，仅用于 demo / 参考实现。v0.3.1 进行了全面的可靠性加固（并发控制、超时、原子写入、错误恢复等），但尚未经过大规模生产验证。成本控制、多租户隔离等企业级功能未系统性处理。项目不代表任何公司或官方产品的立场。
 
 **License**: MIT

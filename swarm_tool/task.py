@@ -8,6 +8,7 @@ Enhanced features (aligned with Oh-My-OpenCode):
 """
 
 import asyncio
+import itertools
 import logging
 from typing import Dict, List, Any, Optional
 
@@ -15,6 +16,7 @@ from ..tool.base import BaseTool, ToolResult
 from ..agent.agent import Agent, AgentConfig
 from ..rollout.sub_rollout import SubRollout, SubRolloutConfig
 from ..utils.category import CategoryRegistry, CategoryConfig
+from ..utils.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,8 @@ class TaskTool(BaseTool):
         max_steps: int = 20,
         category_registry: Optional[CategoryRegistry] = None,
         task_store: Optional[Any] = None,
+        max_concurrent_subagents: int = 10,
+        subtask_timeout: Optional[float] = None,
     ):
         """Initialize Task tool.
 
@@ -52,6 +56,8 @@ class TaskTool(BaseTool):
             max_steps: Maximum steps for sub-agent execution.
             category_registry: Category registry for category-based configs.
             task_store: Optional TaskStore for dependency tracking.
+            max_concurrent_subagents: Max number of sub-agents running at once (Arch #20).
+            subtask_timeout: Max seconds for a single subtask (Arch #18). None = no limit.
         """
         self.agent_registry = agent_registry
         self.parent_agent = parent_agent
@@ -59,12 +65,21 @@ class TaskTool(BaseTool):
         self.max_steps = max_steps
         self.category_registry = category_registry or CategoryRegistry()
         self.task_store = task_store
-        self.subagent_counter = 0
+        # Fix #4: atomic counter using itertools.count
+        self._counter = itertools.count(1)
         self.sub_results: List[Dict[str, Any]] = []
         self._parent_messages_ref: Optional[List[Dict[str, Any]]] = None
+        # Fix #9: snapshot of parent messages at fork time
+        self._parent_messages_snapshot: Optional[List[Dict[str, Any]]] = None
         # Background task tracking
         self._background_tasks: Dict[str, asyncio.Task] = {}
         self._background_results: Dict[str, Dict[str, Any]] = {}
+        # Fix #4: lock for shared mutable state
+        self._lock = asyncio.Lock()
+        # Arch #20: concurrency limiter
+        self._semaphore = asyncio.Semaphore(max_concurrent_subagents)
+        # Arch #18: subtask timeout
+        self._subtask_timeout = subtask_timeout
 
     def set_parent_agent(self, agent: Agent):
         """Set the parent agent reference."""
@@ -75,8 +90,20 @@ class TaskTool(BaseTool):
         self.parent_tools = tools
 
     def set_parent_messages(self, messages: List[Dict[str, Any]]):
-        """Set reference to parent rollout's message list for fork_context."""
+        """Set reference to parent rollout's message list for fork_context.
+
+        Fix #9: Also provides snapshot_parent_messages() for deterministic forking.
+        """
         self._parent_messages_ref = messages
+
+    def snapshot_parent_messages(self):
+        """Take a snapshot of parent messages for deterministic fork_context.
+
+        Should be called by the rollout BEFORE executing parallel tool calls,
+        so all concurrent sub-agents see the same context (Fix #9).
+        """
+        if self._parent_messages_ref:
+            self._parent_messages_snapshot = list(self._parent_messages_ref)
 
     @property
     def name(self) -> str:
@@ -144,12 +171,17 @@ class TaskTool(BaseTool):
         }
 
     def _build_forked_context(self) -> Optional[List[Dict[str, Any]]]:
-        """Extract recent parent conversation messages for context forking."""
-        if not self._parent_messages_ref:
+        """Extract recent parent conversation messages for context forking.
+
+        Fix #9: Prefers snapshot (taken before parallel tool calls) over live reference.
+        """
+        # Use snapshot if available (deterministic), fall back to live reference
+        source = self._parent_messages_snapshot or self._parent_messages_ref
+        if not source:
             return None
 
         non_system = [
-            m for m in self._parent_messages_ref
+            m for m in source
             if m.get("role") != "system"
         ]
         if not non_system:
@@ -237,96 +269,143 @@ class TaskTool(BaseTool):
         fork_context: bool,
         task_id: Optional[str],
     ) -> Dict[str, Any]:
-        """Internal: run a subtask and return result dict."""
-        (
-            system_prompt, model_id, api_key, base_url,
-            temperature, max_tokens,
-            blocked_tools, allowed_tools_only, can_delegate,
-        ) = self._resolve_agent_config(agent_name, category, prompt)
+        """Internal: run a subtask and return result dict.
 
-        subagent_config = AgentConfig(
-            name=subagent_id,
-            system_prompt=system_prompt,
-            model_id=model_id,
-            api_key=api_key,
-            api_base_url=base_url,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            blocked_tools=blocked_tools,
-            allowed_tools_only=allowed_tools_only,
-            can_delegate=can_delegate,
-        )
+        Fixes applied:
+        - Critical #1: Creates independent LLM client when model differs from parent.
+        - Arch #18: Wraps execution with timeout.
+        - Arch #20: Respects concurrency semaphore.
+        """
+        async with self._semaphore:  # Arch #20: concurrency limiter
+            (
+                system_prompt, model_id, api_key, base_url,
+                temperature, max_tokens,
+                blocked_tools, allowed_tools_only, can_delegate,
+            ) = self._resolve_agent_config(agent_name, category, prompt)
 
-        # Create sub-agent with tools (permission filtering handled by Agent)
-        subagent_tools = list(self.parent_tools)
-        # Also include delegation tools if can_delegate is True
-        if not can_delegate:
-            subagent_tools = [
-                tool for tool in subagent_tools
-                if tool.name not in ("create_subagent", "assign_task")
-            ]
+            subagent_config = AgentConfig(
+                name=subagent_id,
+                system_prompt=system_prompt,
+                model_id=model_id,
+                api_key=api_key,
+                api_base_url=base_url,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                blocked_tools=blocked_tools,
+                allowed_tools_only=allowed_tools_only,
+                can_delegate=can_delegate,
+            )
 
-        subagent = Agent(
-            config=subagent_config,
-            tools=subagent_tools,
-            llm_client=self.parent_agent.llm_client if self.parent_agent else None,
-        )
+            # Critical Fix #1: Create independent LLM client when model/key/url differs
+            llm_client = None
+            if self.parent_agent:
+                parent_cfg = self.parent_agent.config
+                parent_model = parent_cfg.subagent_model_id or parent_cfg.model_id
+                parent_key = parent_cfg.subagent_api_key or parent_cfg.api_key
+                parent_url = parent_cfg.subagent_api_base_url or parent_cfg.api_base_url
 
-        # Build forked context
-        context_messages = None
-        if fork_context:
-            context_messages = self._build_forked_context()
-            if context_messages:
-                logger.info(f"{subagent_id}: forking {len(context_messages)} messages")
+                if (model_id != parent_model or
+                    api_key != parent_key or
+                    base_url != parent_url):
+                    # Different model/credentials → independent LLM client
+                    llm_client = LLMClient(
+                        model_id=model_id,
+                        api_key=api_key,
+                        base_url=base_url,
+                    )
+                    logger.info(
+                        f"{subagent_id}: using independent LLM client "
+                        f"(model={model_id}, parent_model={parent_model})"
+                    )
+                else:
+                    llm_client = self.parent_agent.llm_client
 
-        # Update task status if tracked
-        if task_id and self.task_store:
-            self.task_store.update(task_id, status="in_progress", active_form=f"Executing: {prompt[:50]}")
+            # Create sub-agent with tools (permission filtering handled by Agent)
+            subagent_tools = list(self.parent_tools)
+            # Also include delegation tools if can_delegate is True
+            if not can_delegate:
+                subagent_tools = [
+                    tool for tool in subagent_tools
+                    if tool.name not in ("create_subagent", "assign_task")
+                ]
 
-        # Run sub-rollout
-        rollout_config = SubRolloutConfig(
-            max_steps=self.max_steps,
-            step_hint=True,
-            terminal_mode=False,
-        )
+            subagent = Agent(
+                config=subagent_config,
+                tools=subagent_tools,
+                llm_client=llm_client,
+            )
 
-        sub_rollout = SubRollout(rollout_config)
-        result = await sub_rollout.run(
-            agent=subagent,
-            initial_message=prompt,
-            context_messages=context_messages,
-        )
+            # Build forked context
+            context_messages = None
+            if fork_context:
+                context_messages = self._build_forked_context()
+                if context_messages:
+                    logger.info(f"{subagent_id}: forking {len(context_messages)} messages")
 
-        # Format result
-        if result.status.value == "completed":
-            content = result.final_response or "Task completed but no response generated."
-        elif result.status.value == "max_steps_reached":
-            content = f"Sub-agent reached step limit.\n\nLast response:\n{result.final_response or 'No response'}"
-        elif result.status.value == "error":
-            content = f"Sub-agent encountered an error: {result.error}"
-        else:
-            content = f"Sub-agent finished with status: {result.status.value}"
+            # Update task status if tracked
+            if task_id and self.task_store:
+                self.task_store.update(task_id, status="in_progress", active_form=f"Executing: {prompt[:50]}")
 
-        logger.info(f"{subagent_id} completed with status: {result.status.value}")
+            # Run sub-rollout
+            rollout_config = SubRolloutConfig(
+                max_steps=self.max_steps,
+                step_hint=True,
+                terminal_mode=False,
+            )
 
-        # Update task status if tracked
-        if task_id and self.task_store:
-            final_status = "completed" if result.status.value in ("completed", "max_steps_reached") else "pending"
-            self.task_store.update(task_id, status=final_status, result=content[:2000])
+            sub_rollout = SubRollout(rollout_config)
 
-        result_dict = {
-            "agent": agent_name or f"category:{category}",
-            "agent_id": subagent_id,
-            "category": category,
-            "prompt": prompt,
-            "messages": result.messages,
-            "status": result.status.value,
-            "steps": result.steps,
-            "content": content,
-            "task_id": task_id,
-        }
+            # Arch #18: wrap with timeout if configured
+            coro = sub_rollout.run(
+                agent=subagent,
+                initial_message=prompt,
+                context_messages=context_messages,
+            )
+            if self._subtask_timeout:
+                try:
+                    result = await asyncio.wait_for(coro, timeout=self._subtask_timeout)
+                except asyncio.TimeoutError:
+                    logger.error(f"{subagent_id}: timed out after {self._subtask_timeout}s")
+                    from ..rollout.base import RolloutResult, RolloutStatus
+                    result = RolloutResult(
+                        status=RolloutStatus.ERROR,
+                        messages=[],
+                        steps=0,
+                        error=f"Subtask timed out after {self._subtask_timeout} seconds",
+                    )
+            else:
+                result = await coro
 
-        return result_dict
+            # Format result
+            if result.status.value == "completed":
+                content = result.final_response or "Task completed but no response generated."
+            elif result.status.value == "max_steps_reached":
+                content = f"[WARNING: Sub-agent reached step limit]\n\nLast response:\n{result.final_response or 'No response'}"
+            elif result.status.value == "error":
+                content = f"Sub-agent encountered an error: {result.error}"
+            else:
+                content = f"Sub-agent finished with status: {result.status.value}"
+
+            logger.info(f"{subagent_id} completed with status: {result.status.value}")
+
+            # Update task status if tracked
+            if task_id and self.task_store:
+                final_status = "completed" if result.status.value in ("completed", "max_steps_reached") else "pending"
+                self.task_store.update(task_id, status=final_status, result=content[:2000])
+
+            result_dict = {
+                "agent": agent_name or f"category:{category}",
+                "agent_id": subagent_id,
+                "category": category,
+                "prompt": prompt,
+                "messages": result.messages,
+                "status": result.status.value,
+                "steps": result.steps,
+                "content": content,
+                "task_id": task_id,
+            }
+
+            return result_dict
 
     async def execute(
         self,
@@ -363,8 +442,8 @@ class TaskTool(BaseTool):
                     error=f"Agent '{agent}' not found"
                 )
 
-            self.subagent_counter += 1
-            subagent_id = f"subagent_{self.subagent_counter}"
+            # Fix #4: atomic counter using itertools.count
+            subagent_id = f"subagent_{next(self._counter)}"
 
             logger.info(
                 f"Launching {subagent_id} "
@@ -379,15 +458,23 @@ class TaskTool(BaseTool):
                         fork_context, task_id,
                     )
                 )
-                self._background_tasks[subagent_id] = bg_task
+                async with self._lock:
+                    self._background_tasks[subagent_id] = bg_task
 
-                # Set up callback to store result
+                # Fix #10: handle CancelledError (BaseException in Python 3.9+)
                 def _on_complete(future, sid=subagent_id):
                     try:
                         result_dict = future.result()
                         self._background_results[sid] = result_dict
                         self.sub_results.append(result_dict)
                         logger.info(f"Background task {sid} completed")
+                    except asyncio.CancelledError:
+                        self._background_results[sid] = {
+                            "agent_id": sid,
+                            "status": "cancelled",
+                            "content": f"Background task was cancelled.",
+                        }
+                        logger.info(f"Background task {sid} was cancelled")
                     except Exception as e:
                         self._background_results[sid] = {
                             "agent_id": sid,
@@ -457,3 +544,17 @@ class TaskTool(BaseTool):
             logger.info(f"Background task {task_id} cancelled")
             return True
         return False
+
+    def cancel_all_background(self) -> int:
+        """Cancel all running background tasks (Arch #23: graceful shutdown).
+
+        Returns:
+            Number of tasks cancelled.
+        """
+        cancelled = 0
+        for task_id, bg_task in self._background_tasks.items():
+            if not bg_task.done():
+                bg_task.cancel()
+                cancelled += 1
+                logger.info(f"Background task {task_id} cancelled (shutdown)")
+        return cancelled

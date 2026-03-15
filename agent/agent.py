@@ -168,13 +168,26 @@ class Agent:
         Returns:
             Response dict with content and optional tool_calls.
         """
-        # Prepare messages
+        # Prepare messages (always copy to avoid mutating caller's list)
         if include_system:
             if not messages or messages[0].get("role") != "system":
                 messages = [self.get_system_message()] + messages
+            else:
+                messages = list(messages)  # Fix #4: consistent copy behaviour
+        else:
+            messages = list(messages)
 
         # Get tool schemas (only accessible tools)
         tool_schemas = self.get_tool_schemas() if self.tools else None
+
+        # Build optional kwargs for config fields (Fix #8)
+        extra_kwargs = {}
+        if self.config.top_p != 1.0:
+            extra_kwargs["top_p"] = self.config.top_p
+        if self.config.reasoning_effort != "medium":
+            extra_kwargs["reasoning_effort"] = self.config.reasoning_effort
+        if self.config.thinking_budget > 0:
+            extra_kwargs["thinking_budget"] = self.config.thinking_budget
 
         # Call LLM
         response = await self.llm_client.chat(
@@ -182,6 +195,7 @@ class Agent:
             tools=tool_schemas,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            **extra_kwargs,
         )
 
         return response
@@ -250,11 +264,16 @@ class Agent:
             tool_name = tc["function"]["name"]
             args_str = tc["function"]["arguments"]
 
-            # Parse arguments
+            # Parse arguments (Fix #12: report parse failures instead of silent {})
             try:
                 arguments = json.loads(args_str) if isinstance(args_str, str) else args_str
-            except json.JSONDecodeError:
-                arguments = {}
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse arguments for tool '{tool_name}': {e}")
+                return {
+                    "tool_call_id": tc.get("id", tool_name),
+                    "role": "tool",
+                    "content": f"Error: Could not parse tool arguments (invalid JSON). Raw: {str(args_str)[:200]}",
+                }
 
             # Execute tool
             result = await self.execute_tool(tool_name, arguments)

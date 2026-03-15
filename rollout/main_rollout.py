@@ -92,8 +92,9 @@ class MainRollout(BaseRollout):
         self._setup_handoff_ref(agent)
 
         # Inject agent's LLM client into memory for LLM-based summarisation
+        # Fix #17: use public method instead of accessing _llm_client directly
         if self.memory and self.config.enable_llm_summarise:
-            self.memory._llm_client = agent.llm_client
+            self.memory.set_llm_client(agent.llm_client)
             logger.info("Memory: LLM summarisation enabled via agent's LLM client")
 
         result = RolloutResult(
@@ -140,6 +141,26 @@ class MainRollout(BaseRollout):
                 # Reset consecutive error counter on successful LLM call
                 self.consecutive_errors = 0
 
+                # Arch #19: Track token usage if available
+                if self.tracer and response.get("usage"):
+                    self.tracer.log("token_usage", agent_id=agent.config.name,
+                                    step=self.current_step, **response["usage"])
+
+                # Fix #3: Guard against empty responses that would cause infinite loop
+                if self._is_empty_response(response):
+                    self.consecutive_errors += 1
+                    logger.warning(
+                        f"Empty response at step {self.current_step} "
+                        f"(finish_reason={response.get('finish_reason')})"
+                    )
+                    self.messages.append({
+                        "role": "user",
+                        "content": "[System] Received empty response with no content and no tool calls. "
+                                   "Please provide an answer or use a tool to continue."
+                    })
+                    self.current_step += 1
+                    continue
+
                 # Print step info
                 self._print_step(self.current_step, response)
 
@@ -159,6 +180,11 @@ class MainRollout(BaseRollout):
                                 self.tracer.log("subagent_spawn", agent_id=agent.config.name,
                                                 step=self.current_step,
                                                 subagent_id=f"subagent_{len(self.sub_results)+1}")
+
+                    # Fix #9: Snapshot parent messages before parallel tool calls
+                    task_tool = agent.tools.get("assign_task")
+                    if task_tool and hasattr(task_tool, "snapshot_parent_messages"):
+                        task_tool.snapshot_parent_messages()
 
                     tool_results = await agent.execute_tool_calls(response["tool_calls"])
 
@@ -250,8 +276,14 @@ class MainRollout(BaseRollout):
                 final_response=self._get_last_assistant_content(),
             )
 
-        # Handle interruption
+        # Handle interruption (Arch #23: cancel background tasks)
         if self.interrupted:
+            # Cancel all running background tasks
+            task_tool = agent.tools.get("assign_task")
+            if task_tool and hasattr(task_tool, "cancel_all_background"):
+                cancelled = task_tool.cancel_all_background()
+                if cancelled:
+                    logger.info(f"Interrupted: cancelled {cancelled} background tasks")
             result = RolloutResult(
                 status=RolloutStatus.INTERRUPTED,
                 messages=self.messages,
@@ -283,6 +315,10 @@ class MainRollout(BaseRollout):
                 print(f"  Sub-agents spawned: {trace_summary['subagents_spawned']}")
                 print(f"  Errors: {trace_summary['errors']}")
                 print(f"  Total time: {trace_summary['total_time_seconds']}s")
+                if trace_summary.get('total_tokens'):
+                    print(f"  Tokens: {trace_summary['total_tokens']} "
+                          f"(prompt: {trace_summary.get('prompt_tokens', 0)}, "
+                          f"completion: {trace_summary.get('completion_tokens', 0)})")
 
         return result
 
@@ -333,7 +369,10 @@ class MainRollout(BaseRollout):
             if storage_path.endswith(".jsonl"):
                 # Direct file path
                 filepath = storage_path
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                dirpath = os.path.dirname(filepath)
+                # Fix #15: handle relative paths with no directory component
+                if dirpath:
+                    os.makedirs(dirpath, exist_ok=True)
             else:
                 # Directory path
                 os.makedirs(storage_path, exist_ok=True)

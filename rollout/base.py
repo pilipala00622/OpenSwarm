@@ -135,6 +135,10 @@ class BaseRollout(ABC):
         Returns:
             True if task is complete
         """
+        # Fix #2: Never treat error responses as complete
+        if response.get("finish_reason") == "error":
+            return False
+
         # Complete if no tool calls and has content
         if response.get("content") and not response.get("tool_calls"):
             return True
@@ -144,6 +148,16 @@ class BaseRollout(ABC):
             return True
 
         return False
+
+    def _is_empty_response(self, response: Dict[str, Any]) -> bool:
+        """Check if the response is empty (Fix #3).
+
+        An empty response has no content and no tool_calls, which would
+        cause the rollout to spin indefinitely.
+        """
+        return (not response.get("content") and
+                not response.get("tool_calls") and
+                response.get("finish_reason") != "stop")
 
     def _format_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Format LLM response as assistant message
@@ -212,7 +226,10 @@ class BaseRollout(ABC):
             print(f"  {result}")
 
     def interrupt(self):
-        """Signal to interrupt the rollout"""
+        """Signal to interrupt the rollout.
+
+        Arch #23: Also cancels any running background tasks via the agent's TaskTool.
+        """
         self.interrupted = True
         logger.info("Rollout interrupted")
 
@@ -233,6 +250,8 @@ class BaseRollout(ABC):
 
         Checkpoints are saved periodically (controlled by checkpoint_interval)
         and can be used to restore state after consecutive errors.
+
+        Fix #14: Keeps at most 3 checkpoints to limit memory usage.
         """
         import copy
         self.checkpoints.append({
@@ -240,6 +259,10 @@ class BaseRollout(ABC):
             "messages_count": len(self.messages),
             "messages_snapshot": copy.deepcopy(self.messages),
         })
+        # Fix #14: limit checkpoint count (ring buffer style)
+        MAX_CHECKPOINTS = 3
+        while len(self.checkpoints) > MAX_CHECKPOINTS:
+            self.checkpoints.pop(0)
         logger.info(f"Checkpoint saved at step {self.current_step} ({len(self.messages)} messages)")
 
     def _should_save_checkpoint(self) -> bool:

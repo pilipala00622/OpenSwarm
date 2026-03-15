@@ -107,6 +107,19 @@ class SubRollout(BaseRollout):
                 # Reset consecutive error counter on success
                 self.consecutive_errors = 0
 
+                # Fix #3: Guard against empty responses
+                if self._is_empty_response(response):
+                    self.consecutive_errors += 1
+                    logger.warning(
+                        f"Sub-agent empty response at step {self.current_step}"
+                    )
+                    self.messages.append({
+                        "role": "user",
+                        "content": "[System] Received empty response. Please provide an answer or use a tool."
+                    })
+                    self.current_step += 1
+                    continue
+
                 # Print step info (if terminal mode enabled)
                 self._print_step(self.current_step, response)
 

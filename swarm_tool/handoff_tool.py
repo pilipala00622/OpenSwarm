@@ -138,7 +138,14 @@ class HandoffTool(BaseTool):
         )
 
     def _load_handoff(self, handoff_id: str) -> ToolResult:
-        """Load a specific handoff."""
+        """Load a specific handoff.
+
+        TODO (Arch #22): Currently returns handoff as flat text in a ToolResult.
+        For true cross-session context restoration, the context_messages from
+        the handoff document should be injected directly into the rollout's
+        message history (not just rendered as text). This requires a callback
+        mechanism from the tool to the rollout to inject messages.
+        """
         doc = self._manager.load(handoff_id)
         if not doc:
             return ToolResult(

@@ -27,9 +27,17 @@ import logging
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+def _utcnow_iso() -> str:
+    """Get current UTC time as ISO string (Fix #16)."""
+    return datetime.now(timezone.utc).isoformat()
+
+def _utcnow_fmt(fmt: str) -> str:
+    """Format current UTC time (Fix #16)."""
+    return datetime.now(timezone.utc).strftime(fmt)
 
 
 @dataclass
@@ -143,14 +151,32 @@ class HandoffManager:
             Created HandoffDocument.
         """
         import uuid
-        handoff_id = f"H-{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        now = datetime.utcnow().isoformat()
+        handoff_id = f"H-{_utcnow_fmt('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        now = _utcnow_iso()
 
         # Extract completed work, remaining work, and key files from messages
         completed = []
         remaining = []
         key_files = []
         key_decisions = []
+
+        # Fix #11: Populate completed/remaining from task snapshots
+        if tasks:
+            for t in tasks:
+                status = t.get("status", "pending")
+                subject = t.get("subject", "unknown")
+                if status == "completed":
+                    result_snippet = t.get("result", "")
+                    if result_snippet:
+                        completed.append(f"{subject}: {result_snippet[:100]}")
+                    else:
+                        completed.append(subject)
+                elif status in ("pending", "in_progress"):
+                    blocked = t.get("blocked_by", [])
+                    if blocked:
+                        remaining.append(f"{subject} (blocked by: {', '.join(blocked)})")
+                    else:
+                        remaining.append(subject)
 
         # Heuristic extraction from messages
         for msg in messages:

@@ -14,6 +14,10 @@ class CreateSubagentTool(BaseTool):
     This tool allows the main agent to define specialized sub-agents
     with custom system prompts. Created agents can then be used
     with the Task tool.
+
+    TODO (Arch #24): The agent_registry is currently in-memory only.
+    For cross-session persistence (e.g. Handoff resumption), the registry
+    should be persisted to disk (JSON file) alongside the handoff data.
     """
 
     def __init__(self, agent_registry: Dict[str, Dict[str, Any]]):
@@ -51,38 +55,45 @@ class CreateSubagentTool(BaseTool):
                 "system_prompt": {
                     "type": "string",
                     "description": "System prompt defining the agent's role, capabilities, and boundaries"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "If true, overwrite existing agent with the same name (default: false)"
                 }
             },
             "required": ["name", "system_prompt"]
         }
 
-    async def execute(self, name: str, system_prompt: str) -> ToolResult:
+    async def execute(self, name: str, system_prompt: str, overwrite: bool = False) -> ToolResult:
         """Create a new sub-agent configuration
 
         Args:
             name: Unique identifier for the agent
             system_prompt: System prompt for the agent
+            overwrite: If True, update existing agent (Fix #13)
 
         Returns:
             ToolResult indicating success or failure
         """
         try:
             # Check if name already exists
-            if name in self.agent_registry:
+            if name in self.agent_registry and not overwrite:
                 return ToolResult(
-                    content=f"Agent '{name}' already exists. Use it directly with the task tool, or choose a different name.",
+                    content=f"Agent '{name}' already exists. Set overwrite=true to update it, or choose a different name.",
                     success=True
                 )
+
+            action = "Updated" if name in self.agent_registry else "Created"
 
             # Store configuration
             self.agent_registry[name] = {
                 "system_prompt": system_prompt
             }
 
-            logger.info(f"Created sub-agent: {name}")
+            logger.info(f"{action} sub-agent: {name}")
 
             return ToolResult(
-                content=f"Successfully created agent '{name}'. You can now use it with the task tool by specifying agent='{name}'.",
+                content=f"Successfully {action.lower()} agent '{name}'. You can now use it with the task tool by specifying agent='{name}'.",
                 success=True
             )
 

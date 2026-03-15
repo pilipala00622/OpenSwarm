@@ -41,6 +41,10 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        model: Optional[str] = None,
+        top_p: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Send chat completion request with retry logic
 
@@ -49,16 +53,29 @@ class LLMClient:
             tools: Optional list of tool definitions
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
+            model: Model override (uses self.model_id if None)
+            top_p: Nucleus sampling parameter (omitted if None)
+            reasoning_effort: Reasoning effort level for supported models
+            thinking_budget: Extended thinking token budget for supported models
 
         Returns:
             Response dict with content and optional tool_calls
         """
         kwargs = {
-            "model": self.model_id,
+            "model": model or self.model_id,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+
+        # Pass reasoning/thinking params for models that support them
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        if thinking_budget is not None and thinking_budget > 0:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
 
         if tools:
             kwargs["tools"] = tools
@@ -97,6 +114,14 @@ class LLMClient:
                         for tc in message.tool_calls
                     ]
 
+                # Extract usage info for token tracking (Arch #19)
+                if hasattr(response, 'usage') and response.usage:
+                    result["usage"] = {
+                        "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+                        "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+                        "total_tokens": getattr(response.usage, 'total_tokens', 0),
+                    }
+
                 return result
 
             except Exception as e:
@@ -106,8 +131,5 @@ class LLMClient:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
 
         logger.error(f"LLM request failed after {MAX_RETRIES} attempts: {last_error}")
-        return {
-            "role": "assistant",
-            "content": f"Error: {str(last_error)}",
-            "finish_reason": "error",
-        }
+        # Raise exception instead of returning error content (Fix #2)
+        raise RuntimeError(f"LLM request failed after {MAX_RETRIES} attempts: {last_error}")

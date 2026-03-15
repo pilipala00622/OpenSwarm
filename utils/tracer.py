@@ -100,6 +100,16 @@ class RolloutTracer:
                 tool_name = e.data.get("tool", "unknown")
                 tool_usage[tool_name] = tool_usage.get(tool_name, 0) + 1
 
+        # Arch #19: Aggregate token usage
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        for e in self.events:
+            if e.event_type == "token_usage":
+                prompt_tokens += e.data.get("prompt_tokens", 0)
+                completion_tokens += e.data.get("completion_tokens", 0)
+                total_tokens += e.data.get("total_tokens", 0)
+
         return {
             "total_events": len(self.events),
             "total_time_seconds": round(elapsed, 2),
@@ -111,6 +121,10 @@ class RolloutTracer:
             "errors": type_counts.get("error", 0),
             "recoveries": type_counts.get("recovery", 0),
             "tool_usage_breakdown": tool_usage,
+            # Arch #19: token stats
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
         }
 
     def to_jsonl(self, path: str):

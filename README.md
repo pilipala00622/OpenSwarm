@@ -262,9 +262,17 @@ result = await rollout.run(agent, "分析最新的 AI 发展趋势")
 | `background_output` | `BackgroundOutputTool` | 获取后台任务结果 |
 | `background_cancel` | `BackgroundCancelTool` | 取消后台任务 |
 | `task_create` | `TaskCreateTool` | 创建受管理的任务 |
+| `task_claim` | `TaskClaimTool` | team 模式下原子认领下一个可执行任务 |
 | `task_get` | `TaskGetTool` | 按 ID 查询任务 |
 | `task_list` | `TaskListTool` | 列出所有活跃任务 |
 | `task_update` | `TaskUpdateTool` | 更新任务状态 |
+| `team_message` | `TeamMessageTool` | 向指定 teammate 或全队发送消息 |
+| `team_inbox` | `TeamInboxTool` | 拉取当前 teammate 的待处理消息 |
+| `team_lead_inbox` | `TeamLeadInboxTool` | lead 读取所有 teammate 发来的待处理消息 |
+| `team_lead_message` | `TeamLeadMessageTool` | lead 向指定 teammate 或全队发送消息 |
+| `team_members` | `TeamMembersTool` | 查看当前 team 已注册的成员 |
+| `team_status` | `TeamStatusTool` | 查看当前 team id、成员和仍在运行的 team 后台任务 |
+| `team_cleanup` | `TeamCleanupTool` | 清理 team mailbox 状态；必要时可强制取消 team 后台任务 |
 | `handoff` | `HandoffTool` | 创建/加载跨会话交接文档 |
 
 ---
@@ -746,6 +754,7 @@ MainRollout 默认在系统提示词中注入资源分配规则：
 | `blocked_tools` | list | [] | 工具黑名单 |
 | `allowed_tools_only` | list | [] | 工具白名单（非空时仅允许列表内工具） |
 | `can_delegate` | bool | True | 是否允许委派子 Agent |
+| `subagent_mode` | str | "parent" | 子级协作模式：`parent` 为传统父子汇报，`team` 为共享任务/消息协作 |
 
 ### RolloutConfig
 
@@ -795,6 +804,51 @@ MainRollout 默认在系统提示词中注入资源分配规则：
 | `task_store` | TaskStore | None | 持久化任务管理器 |
 | `max_concurrent_subagents` | int | 10 | 最大并发子 Agent 数（Semaphore 限流） |
 | `subtask_timeout` | float | None | 单个子任务超时秒数（None = 无限制） |
+| `team_mailbox` | TeamMailbox | None | team 模式下的共享消息邮箱（默认写入 `.agent_team/`） |
+
+### 子 Agent 协作模式
+
+v0.3.1 起，lead agent 之下的子级协作支持两种模式：
+
+| 模式 | 说明 | 典型行为 |
+|---|---|---|
+| `parent` | 传统父子模式 | 子 Agent 执行完后直接把结果回传给 lead |
+| `team` | team-lite 协作模式 | 子 Agent 可使用共享任务池和 mailbox，与其他 teammate 协作 |
+
+**设置方式**：
+
+```python
+config = AgentConfig(
+    name="main",
+    system_prompt="You are an orchestrator.",
+    subagent_mode="team",   # 默认对子 Agent 使用 team 模式
+)
+```
+
+也可以在单次调用 `assign_task()` 时覆盖：
+
+```python
+await task_tool.execute(
+    prompt="实现解析器并与其他 teammate 协作",
+    subagent_mode="team",
+)
+```
+
+在 `team` 模式下，spawn 出来的子 Agent 会额外获得：
+
+- `task_claim`：原子认领下一个 ready task，避免多个 teammate 抢同一任务
+- `team_message`：给指定 teammate 发消息或广播
+- `team_inbox`：读取自己的待处理消息
+
+lead 侧推荐额外挂载以下工具：
+
+- `team_lead_message`：lead 向指定 teammate 或全队发送消息
+- `team_lead_inbox`：读取 teammate 发给 lead 的消息
+- `team_members`：查看当前有哪些 teammate 已经注册到 team
+- `team_status`：查看 team id、成员和仍在运行的 team-mode 后台任务
+- `team_cleanup`：清理当前 team 的 mailbox 目录；如果还有 team-mode 后台任务，可用 `force=true` 强制取消并清理
+
+注意：当前实现是 **team-lite**，仍然运行在同一 Python 进程内，但已经把子级协作语义从“只向父级汇报”扩展为“可共享任务、可彼此通信”。
 
 ---
 
@@ -1049,3 +1103,25 @@ asyncio.run(main())
 本仓库是**个人性质的实验性项目**，仅用于 demo / 参考实现。v0.3.1 进行了全面的可靠性加固（并发控制、超时、原子写入、错误恢复等），但尚未经过大规模生产验证。成本控制、多租户隔离等企业级功能未系统性处理。项目不代表任何公司或官方产品的立场。
 
 **License**: MIT
+
+
+## 0316 补充和Claude Team的差别
+现有框架：主 Agent 通过工具调用拉起子 Agent，子 Agent 是同一 Python 运行时里的对象/协程，主要向父级回传结果。
+
+Claude teams：lead 和 teammates 都是独立 Claude Code 会话，成员之间可直接通信，并通过共享任务板自协调。
+
+
+Claude teams 的 task list 则更接近一个轻量调度器：
+
+有 pending / in progress / completed
+有依赖阻塞
+有 self-claim
+有 lead assign
+有 file locking 防止多人抢同一个 task
+
+Claude teams 的 teammate 是独立会话，但你当前框架是单进程 runtime。
+第一版完全可以接受：
+
+仍然是 in-process agent
+但在协作语义上模拟 team
+也就是先做 team-lite。

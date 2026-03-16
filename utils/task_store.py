@@ -16,6 +16,7 @@ Example dependency graph:
 import json
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
@@ -84,6 +85,7 @@ class TaskStore:
         self.store_dir = store_dir or os.path.join(os.getcwd(), ".agent_tasks")
         os.makedirs(self.store_dir, exist_ok=True)
         self._tasks: Dict[str, Task] = {}
+        self._lock = threading.Lock()
         self._load_all()
 
     def _task_path(self, task_id: str) -> str:
@@ -144,48 +146,49 @@ class TaskStore:
         Raises:
             ValueError: If blocked_by would create a dependency cycle (Fix #7).
         """
-        task_id = f"T-{uuid.uuid4().hex[:8]}"
-        now = _utcnow_iso()
+        with self._lock:
+            task_id = f"T-{uuid.uuid4().hex[:8]}"
+            now = _utcnow_iso()
 
-        # Fix #7: Validate blocked_by references exist
-        resolved_blockers = []
-        for bid in (blocked_by or []):
-            if bid not in self._tasks:
-                logger.warning(f"Blocker task {bid} not found, ignoring")
-            else:
-                resolved_blockers.append(bid)
+            # Fix #7: Validate blocked_by references exist
+            resolved_blockers = []
+            for bid in (blocked_by or []):
+                if bid not in self._tasks:
+                    logger.warning(f"Blocker task {bid} not found, ignoring")
+                else:
+                    resolved_blockers.append(bid)
 
-        # Fix #7: Check for dependency cycles
-        if resolved_blockers and self._would_create_cycle(task_id, resolved_blockers):
-            raise ValueError(
-                f"Cannot create task {task_id}: blocked_by={resolved_blockers} "
-                f"would create a dependency cycle"
+            # Fix #7: Check for dependency cycles
+            if resolved_blockers and self._would_create_cycle(task_id, resolved_blockers):
+                raise ValueError(
+                    f"Cannot create task {task_id}: blocked_by={resolved_blockers} "
+                    f"would create a dependency cycle"
+                )
+
+            task = Task(
+                id=task_id,
+                subject=subject,
+                description=description,
+                status="pending",
+                blocked_by=resolved_blockers,
+                owner=owner,
+                metadata=metadata or {},
+                created_at=now,
+                updated_at=now,
             )
 
-        task = Task(
-            id=task_id,
-            subject=subject,
-            description=description,
-            status="pending",
-            blocked_by=resolved_blockers,
-            owner=owner,
-            metadata=metadata or {},
-            created_at=now,
-            updated_at=now,
-        )
+            # Update reverse dependency: add this task to blockers' blocks list
+            for blocker_id in task.blocked_by:
+                blocker = self._tasks.get(blocker_id)
+                if blocker and task_id not in blocker.blocks:
+                    blocker.blocks.append(task_id)
+                    blocker.updated_at = now
+                    self._save_task(blocker)
 
-        # Update reverse dependency: add this task to blockers' blocks list
-        for blocker_id in task.blocked_by:
-            blocker = self._tasks.get(blocker_id)
-            if blocker and task_id not in blocker.blocks:
-                blocker.blocks.append(task_id)
-                blocker.updated_at = now
-                self._save_task(blocker)
-
-        self._tasks[task_id] = task
-        self._save_task(task)
-        logger.info(f"Task created: {task_id} - {subject}")
-        return task
+            self._tasks[task_id] = task
+            self._save_task(task)
+            logger.info(f"Task created: {task_id} - {subject}")
+            return task
 
     def _would_create_cycle(self, new_task_id: str, blocked_by: List[str]) -> bool:
         """Check if adding blocked_by edges would create a dependency cycle (Fix #7).
@@ -234,32 +237,85 @@ class TaskStore:
         Returns:
             Updated Task, or None if not found.
         """
-        task = self._tasks.get(task_id)
-        if not task:
-            logger.warning(f"Task not found: {task_id}")
-            return None
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                logger.warning(f"Task not found: {task_id}")
+                return None
 
-        now = _utcnow_iso()
-        task.updated_at = now
+            now = _utcnow_iso()
+            task.updated_at = now
 
-        if status:
-            old_status = task.status
-            task.status = status
+            if status:
+                old_status = task.status
+                task.status = status
 
-            # When completed, unblock dependent tasks
-            if status == "completed" and old_status != "completed":
-                self._unblock_dependents(task_id, now)
+                # When completed, unblock dependent tasks
+                if status == "completed" and old_status != "completed":
+                    self._unblock_dependents(task_id, now)
 
-        if result is not None:
-            task.result = result
-        if active_form is not None:
-            task.active_form = active_form
-        if metadata:
-            task.metadata.update(metadata)
+            if result is not None:
+                task.result = result
+            if active_form is not None:
+                task.active_form = active_form
+            if metadata:
+                task.metadata.update(metadata)
 
-        self._save_task(task)
-        logger.info(f"Task updated: {task_id} -> {task.status}")
-        return task
+            self._save_task(task)
+            logger.info(f"Task updated: {task_id} -> {task.status}")
+            return task
+
+    def claim(
+        self,
+        task_id: str,
+        owner: str,
+        active_form: Optional[str] = None,
+    ) -> Optional[Task]:
+        """Atomically claim a ready task for an owner.
+
+        Claim succeeds only when the task exists, is pending, has no blockers,
+        and is either unowned or already owned by the same agent.
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task or not task.is_ready():
+                return None
+            if task.owner and task.owner != owner:
+                return None
+
+            task.owner = owner
+            task.status = "in_progress"
+            task.updated_at = _utcnow_iso()
+            if active_form is not None:
+                task.active_form = active_form
+            self._save_task(task)
+            logger.info(f"Task claimed: {task.id} by {owner}")
+            return task
+
+    def claim_next_ready(
+        self,
+        owner: str,
+        active_form: Optional[str] = None,
+    ) -> Optional[Task]:
+        """Claim the next ready task for an owner."""
+        with self._lock:
+            ready = [
+                task for task in self._tasks.values()
+                if task.is_ready() and (task.owner is None or task.owner == owner)
+            ]
+            ready.sort(key=lambda task: (task.created_at, task.id))
+            if not ready:
+                return None
+
+            task = ready[0]
+            task.owner = owner
+            task.status = "in_progress"
+            task.updated_at = _utcnow_iso()
+            if active_form is not None:
+                task.active_form = active_form
+            self._save_task(task)
+            logger.info(f"Task claimed: {task.id} by {owner}")
+            return task
 
     def _unblock_dependents(self, completed_id: str, timestamp: str):
         """Remove completed task from all dependents' blocked_by lists."""

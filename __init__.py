@@ -19,8 +19,10 @@ Example:
     from open_swarm.swarm_tool import (
         CreateSubagentTool, TaskTool,
         BackgroundOutputTool, BackgroundCancelTool,
-        TaskCreateTool, TaskListTool, TaskUpdateTool, TaskGetTool,
+        TaskClaimTool, TaskCreateTool, TaskListTool, TaskUpdateTool, TaskGetTool,
         HandoffTool,
+        TeamCleanupTool, TeamInboxTool, TeamLeadInboxTool, TeamLeadMessageTool,
+        TeamMembersTool, TeamMessageTool, TeamStatusTool,
     )
 
     # Setup
@@ -58,11 +60,19 @@ from .swarm_tool import (
     TaskTool,
     BackgroundOutputTool,
     BackgroundCancelTool,
+    TaskClaimTool,
     TaskCreateTool,
     TaskGetTool,
     TaskListTool,
     TaskUpdateTool,
     HandoffTool,
+    TeamCleanupTool,
+    TeamInboxTool,
+    TeamLeadInboxTool,
+    TeamLeadMessageTool,
+    TeamMembersTool,
+    TeamMessageTool,
+    TeamStatusTool,
 )
 from .utils import (
     LLMClient,
@@ -75,6 +85,7 @@ from .utils import (
     Task,
     HandoffManager,
     HandoffDocument,
+    TeamMailbox,
 )
 
 __version__ = "0.3.0"
@@ -102,11 +113,19 @@ __all__ = [
     "TaskTool",
     "BackgroundOutputTool",
     "BackgroundCancelTool",
+    "TaskClaimTool",
     "TaskCreateTool",
     "TaskGetTool",
     "TaskListTool",
     "TaskUpdateTool",
     "HandoffTool",
+    "TeamCleanupTool",
+    "TeamInboxTool",
+    "TeamLeadInboxTool",
+    "TeamLeadMessageTool",
+    "TeamMembersTool",
+    "TeamMessageTool",
+    "TeamStatusTool",
     # Utils
     "LLMClient",
     "AgentMemory",
@@ -118,4 +137,5 @@ __all__ = [
     "Task",
     "HandoffManager",
     "HandoffDocument",
+    "TeamMailbox",
 ]

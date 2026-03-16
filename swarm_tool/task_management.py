@@ -5,6 +5,7 @@ inspired by Oh-My-OpenCode's task system.
 
 Usage:
     task_create: Create a new task with optional dependencies
+    task_claim: Atomically claim the next ready task (or a specific one)
     task_get: Retrieve a task by ID
     task_list: List all active tasks
     task_update: Update task status/metadata
@@ -119,6 +120,65 @@ class TaskGetTool(BaseTool):
 
         info = json.dumps(task.to_dict(), ensure_ascii=False, indent=2)
         return ToolResult(content=info, success=True)
+
+
+class TaskClaimTool(BaseTool):
+    """Claim the next ready task for a specific agent."""
+
+    def __init__(self, task_store: TaskStore, owner: str):
+        self._store = task_store
+        self._owner = owner
+
+    @property
+    def name(self) -> str:
+        return "task_claim"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Atomically claim a ready managed task for the current agent.\n"
+            "If `id` is omitted, claims the next available ready task.\n"
+            "Useful in team mode so teammates can self-claim work without collisions."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Optional task ID to claim. If omitted, claim the next ready task."
+                },
+                "active_form": {
+                    "type": "string",
+                    "description": "Optional present-continuous status (e.g. 'Implementing parser')."
+                }
+            }
+        }
+
+    async def execute(
+        self,
+        id: Optional[str] = None,
+        active_form: Optional[str] = None,
+    ) -> ToolResult:
+        if id:
+            task = self._store.claim(id, owner=self._owner, active_form=active_form)
+        else:
+            task = self._store.claim_next_ready(owner=self._owner, active_form=active_form)
+
+        if not task:
+            target = f"task '{id}'" if id else "any ready task"
+            return ToolResult(
+                content=f"Could not claim {target} for agent '{self._owner}'.",
+                success=False,
+                error="No claimable task found",
+            )
+
+        return ToolResult(
+            content=f"Claimed task {task.id} for '{self._owner}': {task.subject}",
+            success=True,
+        )
 
 
 class TaskListTool(BaseTool):

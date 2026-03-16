@@ -33,6 +33,7 @@ class AgentConfig:
         blocked_tools: Tool names to block (blacklist).
         allowed_tools_only: If non-empty, ONLY these tools are allowed (whitelist).
         can_delegate: Whether this agent can delegate to sub-agents.
+        subagent_mode: Coordination style for spawned sub-agents ("parent" or "team").
     """
     name: str
     system_prompt: str = "You are a helpful assistant."
@@ -50,6 +51,7 @@ class AgentConfig:
     blocked_tools: List[str] = field(default_factory=list)
     allowed_tools_only: List[str] = field(default_factory=list)
     can_delegate: bool = True
+    subagent_mode: str = "parent"
 
 
 class Agent:

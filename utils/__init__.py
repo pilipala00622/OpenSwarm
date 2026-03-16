@@ -6,6 +6,7 @@ from .tracer import RolloutTracer
 from .category import CategoryRegistry, CategoryConfig, BUILTIN_CATEGORIES
 from .task_store import TaskStore, Task
 from .handoff import HandoffManager, HandoffDocument
+from .team_mailbox import TeamMailbox
 
 try:
     from .eval_llm_client import EvalLLMClient
@@ -29,4 +30,5 @@ __all__ = [
     "Task",
     "HandoffManager",
     "HandoffDocument",
+    "TeamMailbox",
 ]

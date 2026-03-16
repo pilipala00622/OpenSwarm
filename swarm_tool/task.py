@@ -10,6 +10,7 @@ Enhanced features (aligned with Oh-My-OpenCode):
 import asyncio
 import itertools
 import logging
+import uuid
 from typing import Dict, List, Any, Optional
 
 from ..tool.base import BaseTool, ToolResult
@@ -17,6 +18,9 @@ from ..agent.agent import Agent, AgentConfig
 from ..rollout.sub_rollout import SubRollout, SubRolloutConfig
 from ..utils.category import CategoryRegistry, CategoryConfig
 from ..utils.llm_client import LLMClient
+from ..utils.team_mailbox import TeamMailbox
+from .task_management import TaskClaimTool
+from .team_tools import TeamInboxTool, TeamMessageTool
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,7 @@ class TaskTool(BaseTool):
     - `category`: Select a pre-configured agent profile (e.g. "quick", "deep").
     - `run_in_background`: Launch agent in background, get result later.
     - `load_skills`: List of skill names to inject (reserved for future use).
+    - `subagent_mode`: Keep parent-child return semantics or enable team-lite coordination.
     """
 
     def __init__(
@@ -46,6 +51,7 @@ class TaskTool(BaseTool):
         task_store: Optional[Any] = None,
         max_concurrent_subagents: int = 10,
         subtask_timeout: Optional[float] = None,
+        team_mailbox: Optional[TeamMailbox] = None,
     ):
         """Initialize Task tool.
 
@@ -58,6 +64,7 @@ class TaskTool(BaseTool):
             task_store: Optional TaskStore for dependency tracking.
             max_concurrent_subagents: Max number of sub-agents running at once (Arch #20).
             subtask_timeout: Max seconds for a single subtask (Arch #18). None = no limit.
+            team_mailbox: Optional mailbox used for team-mode collaboration.
         """
         self.agent_registry = agent_registry
         self.parent_agent = parent_agent
@@ -74,16 +81,24 @@ class TaskTool(BaseTool):
         # Background task tracking
         self._background_tasks: Dict[str, asyncio.Task] = {}
         self._background_results: Dict[str, Dict[str, Any]] = {}
+        self._background_metadata: Dict[str, Dict[str, Any]] = {}
         # Fix #4: lock for shared mutable state
         self._lock = asyncio.Lock()
         # Arch #20: concurrency limiter
         self._semaphore = asyncio.Semaphore(max_concurrent_subagents)
         # Arch #18: subtask timeout
         self._subtask_timeout = subtask_timeout
+        self._team_mailbox = team_mailbox or TeamMailbox()
+        self._team_id: Optional[str] = None
+        if self.parent_agent is not None:
+            self.set_parent_agent(self.parent_agent)
 
     def set_parent_agent(self, agent: Agent):
         """Set the parent agent reference."""
         self.parent_agent = agent
+        if self._team_id is None:
+            self._team_id = f"{agent.config.name}-team-{uuid.uuid4().hex[:6]}"
+        self._team_mailbox.register_member(self._team_id, agent.config.name, role="lead")
 
     def set_parent_tools(self, tools: List[BaseTool]):
         """Set tools available to sub-agents."""
@@ -123,7 +138,8 @@ class TaskTool(BaseTool):
             f"(available: {cat_list}).\n"
             "5. Set `run_in_background=true` to launch in background; "
             "use `background_output` tool to retrieve results later.\n"
-            "6. Specify `task_id` to track this as a managed task with dependencies."
+            "6. Specify `task_id` to track this as a managed task with dependencies.\n"
+            "7. Set `subagent_mode='team'` to let spawned agents self-claim tasks and message teammates."
         )
 
     @property
@@ -165,6 +181,15 @@ class TaskTool(BaseTool):
                 "task_id": {
                     "type": "string",
                     "description": "Managed task ID to track this execution against"
+                },
+                "subagent_mode": {
+                    "type": "string",
+                    "enum": ["parent", "team"],
+                    "description": (
+                        "Coordination style for spawned agents. "
+                        "'parent' keeps the classic parent-child return path; "
+                        "'team' enables task self-claiming and teammate messaging."
+                    )
                 },
             },
             "required": ["prompt"]
@@ -260,6 +285,239 @@ class TaskTool(BaseTool):
             blocked_tools, allowed_tools_only, can_delegate,
         )
 
+    def _resolve_subagent_mode(self, requested_mode: Optional[str]) -> str:
+        """Resolve coordination mode for newly spawned sub-agents."""
+        mode = requested_mode
+        if mode is None and self.parent_agent:
+            mode = getattr(self.parent_agent.config, "subagent_mode", "parent")
+        mode = mode or "parent"
+        if mode not in {"parent", "team"}:
+            raise ValueError(f"Unsupported subagent_mode: {mode}")
+        return mode
+
+    def _ensure_team_id(self) -> str:
+        """Get or create a stable team id for this task tool instance."""
+        if self._team_id is None:
+            lead_name = self.parent_agent.config.name if self.parent_agent else "lead"
+            self._team_id = f"{lead_name}-team-{uuid.uuid4().hex[:6]}"
+            self._team_mailbox.register_member(self._team_id, lead_name, role="lead")
+        return self._team_id
+
+    def get_team_id(self) -> Optional[str]:
+        """Return the current team id, if initialized."""
+        return self._team_id
+
+    def get_lead_agent_id(self) -> Optional[str]:
+        """Return the lead agent id, if available."""
+        if not self.parent_agent:
+            return None
+        return self.parent_agent.config.name
+
+    def _build_team_guidance(
+        self,
+        team_id: str,
+        subagent_id: str,
+        task_id: Optional[str],
+    ) -> str:
+        """Team-mode instructions injected into the sub-agent system prompt."""
+        lines = [
+            "[Team Mode Enabled]",
+            f"- Team ID: {team_id}",
+            f"- Your agent ID: {subagent_id}",
+            "- You are collaborating with teammates, not only reporting to the parent.",
+            "- Use `team_message` to share findings or coordinate dependencies.",
+            "- Use `team_inbox` periodically to read teammate updates.",
+        ]
+        if self.task_store:
+            lines.append("- Use `task_claim` to self-claim ready tasks when appropriate.")
+            lines.append("- Keep task state accurate with `task_update` when work is completed.")
+        if task_id:
+            lines.append(f"- You were launched for managed task: {task_id}")
+        return "\n".join(lines)
+
+    def _build_subagent_tools(
+        self,
+        subagent_id: str,
+        can_delegate: bool,
+        subagent_mode: str,
+    ) -> List[BaseTool]:
+        """Build tool list for a spawned sub-agent."""
+        subagent_tools = list(self.parent_tools)
+        subagent_tools = [
+            tool for tool in subagent_tools
+            if tool.name not in ("team_cleanup", "team_lead_inbox", "team_lead_message")
+        ]
+        if not can_delegate:
+            subagent_tools = [
+                tool for tool in subagent_tools
+                if tool.name not in ("create_subagent", "assign_task")
+            ]
+
+        if subagent_mode == "team":
+            team_id = self._ensure_team_id()
+            self._team_mailbox.register_member(team_id, subagent_id, role="teammate")
+            subagent_tools.extend([
+                TeamMessageTool(self._team_mailbox, team_id=team_id, sender_id=subagent_id),
+                TeamInboxTool(self._team_mailbox, team_id=team_id, recipient_id=subagent_id),
+            ])
+            if self.task_store:
+                subagent_tools.append(TaskClaimTool(self.task_store, owner=subagent_id))
+
+        return subagent_tools
+
+    def get_lead_inbox(
+        self,
+        clear: bool = True,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch pending team messages addressed to the lead."""
+        team_id = self.get_team_id()
+        lead_id = self.get_lead_agent_id()
+        if not team_id or not lead_id:
+            return []
+        return self._team_mailbox.fetch_messages(
+            team_id=team_id,
+            agent_id=lead_id,
+            clear=clear,
+            limit=limit,
+        )
+
+    def get_team_members(self, include_lead: bool = False) -> List[Dict[str, str]]:
+        """List registered team members for the current team."""
+        team_id = self.get_team_id()
+        lead_id = self.get_lead_agent_id()
+        if not team_id:
+            return []
+        members = self._team_mailbox.list_members(team_id)
+        if include_lead:
+            return members
+        return [member for member in members if member.get("agent_id") != lead_id]
+
+    def send_lead_message(
+        self,
+        content: str,
+        recipient: Optional[str] = None,
+        broadcast: bool = False,
+    ) -> Dict[str, Any]:
+        """Send a direct or broadcast message from the lead to teammates."""
+        team_id = self.get_team_id()
+        lead_id = self.get_lead_agent_id()
+        if not team_id or not lead_id:
+            return {
+                "success": False,
+                "message": "No active team is available for lead messaging.",
+                "delivered": 0,
+                "team_id": team_id,
+            }
+
+        if not broadcast and not recipient:
+            return {
+                "success": False,
+                "message": "Either recipient or broadcast=true is required.",
+                "delivered": 0,
+                "team_id": team_id,
+            }
+
+        delivered = self._team_mailbox.send_message(
+            team_id=team_id,
+            sender=lead_id,
+            recipient=recipient,
+            content=content,
+            broadcast=broadcast,
+        )
+        target = "team" if broadcast else recipient
+        return {
+            "success": True,
+            "message": f"Lead message sent to {target}.",
+            "delivered": delivered,
+            "team_id": team_id,
+            "lead_id": lead_id,
+        }
+
+    def get_team_status(self, include_lead: bool = True) -> Dict[str, Any]:
+        """Return current team metadata and running team-mode background tasks."""
+        team_id = self.get_team_id()
+        lead_id = self.get_lead_agent_id()
+        members = self.get_team_members(include_lead=include_lead)
+
+        running_tasks = []
+        if team_id:
+            for task_id, bg_task in self._background_tasks.items():
+                metadata = self._background_metadata.get(task_id, {})
+                if (
+                    metadata.get("team_id") == team_id
+                    and metadata.get("subagent_mode") == "team"
+                    and not bg_task.done()
+                ):
+                    running_tasks.append({
+                        "task_id": task_id,
+                        "status": "running",
+                        "team_id": team_id,
+                        "subagent_mode": "team",
+                    })
+
+        return {
+            "team_id": team_id,
+            "lead_id": lead_id,
+            "member_count": len(members),
+            "members": members,
+            "running_team_tasks": running_tasks,
+        }
+
+    def cleanup_team(self, force: bool = False) -> Dict[str, Any]:
+        """Clean up persisted team mailbox state.
+
+        If force is False, cleanup fails when team-mode background tasks
+        are still running for the current team.
+        """
+        team_id = self.get_team_id()
+        if not team_id:
+            return {
+                "success": False,
+                "message": "No active team has been initialized.",
+                "running_tasks": [],
+            }
+
+        running_tasks = [
+            task_id
+            for task_id, bg_task in self._background_tasks.items()
+            if not bg_task.done()
+            and self._background_metadata.get(task_id, {}).get("team_id") == team_id
+            and self._background_metadata.get(task_id, {}).get("subagent_mode") == "team"
+        ]
+
+        if running_tasks and not force:
+            return {
+                "success": False,
+                "message": (
+                    "Cannot clean up team while team-mode background tasks are still running. "
+                    "Cancel them first or pass force=True."
+                ),
+                "running_tasks": running_tasks,
+            }
+
+        cancelled = []
+        if force:
+            for task_id in running_tasks:
+                bg_task = self._background_tasks.get(task_id)
+                if bg_task and not bg_task.done():
+                    bg_task.cancel()
+                    cancelled.append(task_id)
+
+        deleted = self._team_mailbox.cleanup_team(team_id)
+        old_team_id = self._team_id
+        self._team_id = None
+        if self.parent_agent:
+            self.set_parent_agent(self.parent_agent)
+
+        return {
+            "success": deleted,
+            "message": f"Team '{old_team_id}' cleaned up." if deleted else f"Team '{old_team_id}' not found.",
+            "running_tasks": running_tasks,
+            "cancelled_tasks": cancelled,
+            "new_team_id": self._team_id,
+        }
+
     async def _run_subtask(
         self,
         subagent_id: str,
@@ -268,6 +526,7 @@ class TaskTool(BaseTool):
         category: Optional[str],
         fork_context: bool,
         task_id: Optional[str],
+        subagent_mode: str,
     ) -> Dict[str, Any]:
         """Internal: run a subtask and return result dict.
 
@@ -283,6 +542,14 @@ class TaskTool(BaseTool):
                 blocked_tools, allowed_tools_only, can_delegate,
             ) = self._resolve_agent_config(agent_name, category, prompt)
 
+            if subagent_mode == "team":
+                team_guidance = self._build_team_guidance(
+                    team_id=self._ensure_team_id(),
+                    subagent_id=subagent_id,
+                    task_id=task_id,
+                )
+                system_prompt = f"{system_prompt}\n\n{team_guidance}"
+
             subagent_config = AgentConfig(
                 name=subagent_id,
                 system_prompt=system_prompt,
@@ -294,6 +561,7 @@ class TaskTool(BaseTool):
                 blocked_tools=blocked_tools,
                 allowed_tools_only=allowed_tools_only,
                 can_delegate=can_delegate,
+                subagent_mode=subagent_mode,
             )
 
             # Critical Fix #1: Create independent LLM client when model/key/url differs
@@ -321,13 +589,11 @@ class TaskTool(BaseTool):
                     llm_client = self.parent_agent.llm_client
 
             # Create sub-agent with tools (permission filtering handled by Agent)
-            subagent_tools = list(self.parent_tools)
-            # Also include delegation tools if can_delegate is True
-            if not can_delegate:
-                subagent_tools = [
-                    tool for tool in subagent_tools
-                    if tool.name not in ("create_subagent", "assign_task")
-                ]
+            subagent_tools = self._build_subagent_tools(
+                subagent_id=subagent_id,
+                can_delegate=can_delegate,
+                subagent_mode=subagent_mode,
+            )
 
             subagent = Agent(
                 config=subagent_config,
@@ -344,7 +610,30 @@ class TaskTool(BaseTool):
 
             # Update task status if tracked
             if task_id and self.task_store:
-                self.task_store.update(task_id, status="in_progress", active_form=f"Executing: {prompt[:50]}")
+                if subagent_mode == "team":
+                    claimed = self.task_store.claim(
+                        task_id,
+                        owner=subagent_id,
+                        active_form=f"Executing: {prompt[:50]}",
+                    )
+                    if not claimed:
+                        return {
+                            "agent": agent_name or f"category:{category}",
+                            "agent_id": subagent_id,
+                            "category": category,
+                            "prompt": prompt,
+                            "messages": [],
+                            "status": "error",
+                            "steps": 0,
+                            "content": (
+                                f"Sub-agent could not claim task '{task_id}'. "
+                                "It may be blocked, already owned, or already in progress."
+                            ),
+                            "task_id": task_id,
+                            "subagent_mode": subagent_mode,
+                        }
+                else:
+                    self.task_store.update(task_id, status="in_progress", active_form=f"Executing: {prompt[:50]}")
 
             # Run sub-rollout
             rollout_config = SubRolloutConfig(
@@ -397,6 +686,7 @@ class TaskTool(BaseTool):
                 "agent": agent_name or f"category:{category}",
                 "agent_id": subagent_id,
                 "category": category,
+                "subagent_mode": subagent_mode,
                 "prompt": prompt,
                 "messages": result.messages,
                 "status": result.status.value,
@@ -416,6 +706,7 @@ class TaskTool(BaseTool):
         run_in_background: bool = False,
         load_skills: Optional[List[str]] = None,
         task_id: Optional[str] = None,
+        subagent_mode: Optional[str] = None,
     ) -> ToolResult:
         """Launch a sub-agent to execute a task.
 
@@ -427,6 +718,7 @@ class TaskTool(BaseTool):
             run_in_background: Launch in background.
             load_skills: Skills to load (reserved for future).
             task_id: Managed task ID.
+            subagent_mode: Optional override for spawned-agent coordination mode.
 
         Returns:
             ToolResult with sub-agent's response (or background task ID).
@@ -444,22 +736,29 @@ class TaskTool(BaseTool):
 
             # Fix #4: atomic counter using itertools.count
             subagent_id = f"subagent_{next(self._counter)}"
+            resolved_mode = self._resolve_subagent_mode(subagent_mode)
 
             logger.info(
                 f"Launching {subagent_id} "
-                f"(agent={agent}, category={category}, background={run_in_background})"
+                f"(agent={agent}, category={category}, background={run_in_background}, "
+                f"subagent_mode={resolved_mode})"
             )
 
             if run_in_background:
+                bg_team_id = self._ensure_team_id() if resolved_mode == "team" else None
                 # Launch as background task
                 bg_task = asyncio.create_task(
                     self._run_subtask(
                         subagent_id, agent, prompt, category,
-                        fork_context, task_id,
+                        fork_context, task_id, resolved_mode,
                     )
                 )
                 async with self._lock:
                     self._background_tasks[subagent_id] = bg_task
+                    self._background_metadata[subagent_id] = {
+                        "subagent_mode": resolved_mode,
+                        "team_id": bg_team_id,
+                    }
 
                 # Fix #10: handle CancelledError (BaseException in Python 3.9+)
                 def _on_complete(future, sid=subagent_id):
@@ -496,7 +795,7 @@ class TaskTool(BaseTool):
             # Synchronous execution
             result_dict = await self._run_subtask(
                 subagent_id, agent, prompt, category,
-                fork_context, task_id,
+                fork_context, task_id, resolved_mode,
             )
 
             self.sub_results.append(result_dict)

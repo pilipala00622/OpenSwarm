@@ -57,6 +57,33 @@ This configuration uses kimi-k2.5 for the main agent and qwen2.5-72b-instruct fo
 - Faster execution with fewer steps
 - Good for tasks requiring quick parallel processing
 
+### 4. Parent vs Team demo (no external API needed)
+
+```bash
+python3 run_parent_team_demo.py
+```
+
+This demo uses a tiny in-memory fake LLM client and shows:
+- `parent` mode: sub-agent finishes and reports directly to the lead
+- `team` mode: teammates broadcast progress, lead can inspect `team_members` / `team_status`,
+  then read `team_lead_inbox` and run `team_cleanup`
+
+### 5. Team live demo (real function-calling model)
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPEN_SWARM_MODEL="gpt-4o-mini"   # optional
+python3 run_team_live_demo.py
+```
+
+This demo uses the real `LLMClient` and asks the lead agent to:
+- create managed tasks
+- spawn teammates with `assign_task(..., subagent_mode="team")`
+- send guidance via `team_lead_message`
+- inspect coordination state with `team_members` and `team_status`
+- read teammate updates with `team_lead_inbox`
+- finish with `team_cleanup`
+
 ## Output
 
 Results are saved to the `result/` directory as JSONL files:

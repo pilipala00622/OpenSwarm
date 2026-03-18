@@ -69,6 +69,15 @@ class TeamMessageTool(BaseTool):
             broadcast=broadcast,
         )
         target = "team" if broadcast else recipient
+        if delivered == 0:
+            return ToolResult(
+                content="",
+                success=False,
+                error=(
+                    f"No valid recipients found for message to {target}. "
+                    "The teammate may not exist or may not be registered yet."
+                ),
+            )
         return ToolResult(
             content=f"Message sent from '{self._sender_id}' to {target}. Delivered to {delivered} inbox(es).",
             success=True,

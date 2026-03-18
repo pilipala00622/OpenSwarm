@@ -426,6 +426,17 @@ class TaskTool(BaseTool):
             broadcast=broadcast,
         )
         target = "team" if broadcast else recipient
+        if delivered == 0:
+            return {
+                "success": False,
+                "message": (
+                    f"No valid recipients found for lead message to {target}. "
+                    "Check `team_members` before sending targeted instructions."
+                ),
+                "delivered": 0,
+                "team_id": team_id,
+                "lead_id": lead_id,
+            }
         return {
             "success": True,
             "message": f"Lead message sent to {target}.",
@@ -454,6 +465,8 @@ class TaskTool(BaseTool):
                         "status": "running",
                         "team_id": team_id,
                         "subagent_mode": "team",
+                        "managed_task_id": metadata.get("task_id"),
+                        "agent_id": metadata.get("agent_id"),
                     })
 
         return {
@@ -463,6 +476,31 @@ class TaskTool(BaseTool):
             "members": members,
             "running_team_tasks": running_tasks,
         }
+
+    def _finalize_managed_task(
+        self,
+        task_id: Optional[str],
+        subagent_mode: str,
+        task_result_status: str,
+        content: str,
+    ):
+        """Finalize managed task state after a sub-agent finishes.
+
+        Team-mode tasks that fail or get cancelled are released back to pending so
+        other teammates can claim them again.
+        """
+        if not task_id or not self.task_store:
+            return
+
+        success_statuses = {"completed", "max_steps_reached"}
+        if task_result_status in success_statuses:
+            self.task_store.update(task_id, status="completed", result=content[:2000], active_form="")
+            return
+
+        if subagent_mode == "team":
+            self.task_store.release(task_id, result=content[:2000], clear_owner=True)
+        else:
+            self.task_store.update(task_id, status="pending", result=content[:2000], active_form="")
 
     def cleanup_team(self, force: bool = False) -> Dict[str, Any]:
         """Clean up persisted team mailbox state.
@@ -503,6 +541,13 @@ class TaskTool(BaseTool):
                 if bg_task and not bg_task.done():
                     bg_task.cancel()
                     cancelled.append(task_id)
+                    metadata = self._background_metadata.get(task_id, {})
+                    self._finalize_managed_task(
+                        task_id=metadata.get("task_id"),
+                        subagent_mode=metadata.get("subagent_mode", "parent"),
+                        task_result_status="cancelled",
+                        content="Background task was cancelled during team cleanup.",
+                    )
 
         deleted = self._team_mailbox.cleanup_team(team_id)
         old_team_id = self._team_id
@@ -678,9 +723,12 @@ class TaskTool(BaseTool):
             logger.info(f"{subagent_id} completed with status: {result.status.value}")
 
             # Update task status if tracked
-            if task_id and self.task_store:
-                final_status = "completed" if result.status.value in ("completed", "max_steps_reached") else "pending"
-                self.task_store.update(task_id, status=final_status, result=content[:2000])
+            self._finalize_managed_task(
+                task_id=task_id,
+                subagent_mode=subagent_mode,
+                task_result_status=result.status.value,
+                content=content,
+            )
 
             result_dict = {
                 "agent": agent_name or f"category:{category}",
@@ -758,16 +806,25 @@ class TaskTool(BaseTool):
                     self._background_metadata[subagent_id] = {
                         "subagent_mode": resolved_mode,
                         "team_id": bg_team_id,
+                        "task_id": task_id,
+                        "agent_id": subagent_id,
                     }
 
                 # Fix #10: handle CancelledError (BaseException in Python 3.9+)
                 def _on_complete(future, sid=subagent_id):
+                    metadata = self._background_metadata.get(sid, {})
                     try:
                         result_dict = future.result()
                         self._background_results[sid] = result_dict
                         self.sub_results.append(result_dict)
                         logger.info(f"Background task {sid} completed")
                     except asyncio.CancelledError:
+                        self._finalize_managed_task(
+                            task_id=metadata.get("task_id"),
+                            subagent_mode=metadata.get("subagent_mode", "parent"),
+                            task_result_status="cancelled",
+                            content="Background task was cancelled.",
+                        )
                         self._background_results[sid] = {
                             "agent_id": sid,
                             "status": "cancelled",
@@ -775,6 +832,12 @@ class TaskTool(BaseTool):
                         }
                         logger.info(f"Background task {sid} was cancelled")
                     except Exception as e:
+                        self._finalize_managed_task(
+                            task_id=metadata.get("task_id"),
+                            subagent_mode=metadata.get("subagent_mode", "parent"),
+                            task_result_status="error",
+                            content=f"Background task failed: {e}",
+                        )
                         self._background_results[sid] = {
                             "agent_id": sid,
                             "status": "error",

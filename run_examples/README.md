@@ -84,6 +84,73 @@ This demo uses the real `LLMClient` and asks the lead agent to:
 - read teammate updates with `team_lead_inbox`
 - finish with `team_cleanup`
 
+### 6. Knowledge engine demo (no external API needed)
+
+```bash
+python3 run_knowledge_engine_demo.py
+```
+
+This demo shows the new local knowledge engine layer:
+- indexes local code and markdown files
+- extracts Python defs/imports and markdown headings
+- returns ranked context hits plus related files
+- useful for architecture questions before spawning agents
+
+## Why Tools Matter
+
+These examples are intentionally organized around tools rather than only around models.
+
+In `agent-swarm`, the model is responsible for reasoning, but tools determine:
+
+- what the agent can observe
+- what the agent can change
+- how multiple agents coordinate
+- whether the system is recoverable and debuggable
+
+You can think of the current tool layer in three parts:
+
+### 1. Execution tools
+
+These let the agent take action:
+
+- `assign_task`
+- `background_output`
+- `background_cancel`
+- `task_create`
+- `task_update`
+
+Without them, the agent can only describe a plan, not execute one.
+
+### 2. Coordination tools
+
+These make multi-agent workflows possible:
+
+- `task_claim`
+- `team_message`
+- `team_inbox`
+- `team_lead_message`
+- `team_lead_inbox`
+- `team_members`
+- `team_status`
+- `team_cleanup`
+
+Without them, `team` mode would degrade into a set of isolated workers with no shared state.
+
+### 3. Context tools
+
+These improve the quality of reasoning before execution:
+
+- `search`
+- `verify_result`
+- `retrieve_context`
+
+`retrieve_context` is especially important because it adds a lightweight knowledge engine layer:
+before an agent acts, it can first retrieve relevant code, symbols, docs, and related files from the local repository.
+
+In practice, better tools usually matter more than simply adding more agents.  
+More agents without task, status, and context tools often just means more noise.  
+Well-designed tools give the lead and teammates a reliable execution surface.
+
 ## Output
 
 Results are saved to the `result/` directory as JSONL files:

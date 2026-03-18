@@ -317,6 +317,33 @@ class TaskStore:
             logger.info(f"Task claimed: {task.id} by {owner}")
             return task
 
+    def release(
+        self,
+        task_id: str,
+        result: Optional[str] = None,
+        clear_owner: bool = True,
+    ) -> Optional[Task]:
+        """Return an in-progress task to pending so it can be re-claimed.
+
+        This is used when a teammate errors, times out, or gets cancelled.
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                logger.warning(f"Task not found: {task_id}")
+                return None
+
+            task.status = "pending"
+            task.updated_at = _utcnow_iso()
+            task.active_form = ""
+            if clear_owner:
+                task.owner = None
+            if result is not None:
+                task.result = result
+            self._save_task(task)
+            logger.info(f"Task released: {task.id} back to pending")
+            return task
+
     def _unblock_dependents(self, completed_id: str, timestamp: str):
         """Remove completed task from all dependents' blocked_by lists."""
         for task in self._tasks.values():

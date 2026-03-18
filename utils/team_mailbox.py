@@ -68,6 +68,10 @@ class TeamMailbox:
             data = json.load(f)
         return data if isinstance(data, list) else []
 
+    def has_member(self, team_id: str, agent_id: str) -> bool:
+        """Check whether an agent is registered in a team."""
+        return any(member.get("agent_id") == agent_id for member in self.list_members(team_id))
+
     def send_message(
         self,
         team_id: str,
@@ -79,14 +83,18 @@ class TeamMailbox:
         self._ensure_team_dirs(team_id)
         delivered = 0
         with self._lock:
+            members = self.list_members(team_id)
+            member_ids = {member["agent_id"] for member in members}
+            if sender not in member_ids:
+                return 0
+
             if broadcast:
                 recipients = [
-                    member["agent_id"]
-                    for member in self.list_members(team_id)
+                    member["agent_id"] for member in members
                     if member["agent_id"] != sender
                 ]
             elif recipient:
-                recipients = [recipient]
+                recipients = [recipient] if recipient in member_ids else []
             else:
                 recipients = []
 

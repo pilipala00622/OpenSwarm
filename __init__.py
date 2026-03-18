@@ -3,7 +3,7 @@
 A lightweight, extensible framework for orchestrating multiple AI agents
 to collaboratively solve complex tasks.
 
-Features (v0.3.0 — aligned with Oh-My-OpenCode):
+Features (v0.4.1):
 - Category system for task-specific agent profiles
 - Tool permission control (blacklist / whitelist)
 - Background task execution and retrieval
@@ -54,7 +54,7 @@ from .rollout import (
     RolloutResult,
     RolloutStatus,
 )
-from .tool import BaseTool, ToolResult, SearchTool, VerifyTool
+from .tool import BaseTool, ToolResult, RetrieveContextTool, SearchTool, VerifyTool
 from .swarm_tool import (
     CreateSubagentTool,
     TaskTool,
@@ -81,6 +81,7 @@ from .utils import (
     CategoryRegistry,
     CategoryConfig,
     BUILTIN_CATEGORIES,
+    KnowledgeEngine,
     TaskStore,
     Task,
     HandoffManager,
@@ -88,7 +89,7 @@ from .utils import (
     TeamMailbox,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.1"
 __author__ = "Open Swarm Contributors"
 
 __all__ = [
@@ -106,6 +107,7 @@ __all__ = [
     # Tool
     "BaseTool",
     "ToolResult",
+    "RetrieveContextTool",
     "SearchTool",
     "VerifyTool",
     # Swarm Tools
@@ -133,6 +135,7 @@ __all__ = [
     "CategoryRegistry",
     "CategoryConfig",
     "BUILTIN_CATEGORIES",
+    "KnowledgeEngine",
     "TaskStore",
     "Task",
     "HandoffManager",

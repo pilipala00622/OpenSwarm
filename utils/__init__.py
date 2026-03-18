@@ -4,6 +4,7 @@ from .tools_flow import get_tools_full_logic, get_tool_schemas_json, print_tools
 from .memory import AgentMemory
 from .tracer import RolloutTracer
 from .category import CategoryRegistry, CategoryConfig, BUILTIN_CATEGORIES
+from .knowledge_engine import KnowledgeEngine
 from .task_store import TaskStore, Task
 from .handoff import HandoffManager, HandoffDocument
 from .team_mailbox import TeamMailbox
@@ -26,6 +27,7 @@ __all__ = [
     "CategoryRegistry",
     "CategoryConfig",
     "BUILTIN_CATEGORIES",
+    "KnowledgeEngine",
     "TaskStore",
     "Task",
     "HandoffManager",

@@ -14,6 +14,7 @@
   - [Agent 智能体](#agent-智能体)
   - [Rollout 执行循环](#rollout-执行循环)
   - [Tool 工具系统](#tool-工具系统)
+  - [执行环境层：Runtime 与 Sandbox](#执行环境层runtime-与-sandbox)
 - [七大核心功能](#七大核心功能)
   - [1. Category 任务类别系统](#1-category-任务类别系统)
   - [2. Tool 权限控制](#2-tool-权限控制)
@@ -174,6 +175,7 @@ agent-swarm/
 │   └── multi_agent.py           # 多 Agent 完整功能展示
 │
 ├── run_examples/                # 多种配置的运行脚本
+├── containers/                  # 容器化开发/运行时基础设施（app/dev/runtime/e2b-sandbox）
 ├── result/                      # 运行结果存储目录
 ├── setup.py                     # 安装脚本
 └── requirements.txt             # 依赖声明
@@ -278,6 +280,112 @@ result = await rollout.run(agent, "分析最新的 AI 发展趋势")
 | `team_status` | `TeamStatusTool` | 查看当前 team id、成员和仍在运行的 team 后台任务 |
 | `team_cleanup` | `TeamCleanupTool` | 清理 team mailbox 状态；必要时可强制取消 team 后台任务 |
 | `handoff` | `HandoffTool` | 创建/加载跨会话交接文档 |
+
+---
+
+### 执行环境层：Runtime 与 Sandbox
+
+在这个仓库里，`runtime` 指的不是某个 Python 类，而是 **Agent 实际执行代码、命令、文件操作时所处的环境**。  
+也就是说，模型负责“决定做什么”，`TaskTool` / `Rollout` 负责“组织谁去做”，而 `runtime` 负责“这些动作究竟在哪里做、以什么权限做、能访问什么资源”。
+
+对多 Agent 框架来说，`runtime` 通常决定：
+
+- 代码和 shell 命令在哪里运行
+- 文件修改发生在哪个工作区
+- 进程使用什么用户身份和权限
+- 能否隔离不同任务、不同用户或不同 team 的执行副作用
+
+因此，`runtime` 更接近**执行层基础设施**，而不是推理层能力。
+
+#### 当前仓库里的状态
+
+当前 `v0.4.1` 的主线仍然是 **单进程 orchestration runtime**：
+
+- lead 和子 Agent 主要是同一 Python 进程中的对象/协程
+- `team-lite` 扩展的是协作语义，而不是进程级隔离
+- `CodeRunnerTool` 当前仍以本地子进程方式执行 Python / JavaScript
+
+这意味着本仓库已经具备比较完整的 **控制面（control plane）**：
+
+- Agent 配置与工具权限
+- Rollout 执行循环
+- 子 Agent 分派与 team-lite 协作
+- 任务依赖、handoff、memory、知识引擎
+
+但**执行面（execution plane）** 仍然偏轻，`containers/` 更像是把框架进一步升级为可隔离执行系统的基础设施入口。
+
+#### `containers/` 在做什么
+
+`containers/` 目录不是主编排逻辑，而是一组围绕运行环境的容器资产：
+
+- `containers/app/`：主应用镜像，负责打包前后端与服务入口
+- `containers/dev/`：开发容器，提供一致的 Docker 开发环境
+- `containers/runtime/`：给 Agent 执行动作准备的运行时镜像/沙箱镜像
+- `containers/e2b-sandbox/`：把沙箱运行环境迁移到 E2B 的模板配置
+- `containers/build.sh`：镜像构建与发布脚本
+
+可以把它理解成：
+
+- `agent/`、`rollout/`、`swarm_tool/`、`utils/`：大脑、调度器和状态系统
+- `containers/`：工作环境、隔离边界和部署载体
+
+#### 什么是 Runtime
+
+在 agent 系统里，`runtime` 就是“实际干活的环境”。
+
+没有 `runtime`，Agent 只能做推理和规划；  
+有了 `runtime`，Agent 才能真正去：
+
+- 运行 Python / JavaScript
+- 执行 shell 命令
+- 读写工作区文件
+- 安装依赖、跑测试、调用本地工具
+
+这也是为什么 `runtime` 往往决定一个 agent 系统能否从 demo 走向真实可用：它关系到安全性、一致性、可复现性和资源控制。
+
+#### 什么是 Sandbox
+
+`sandbox` 是 `runtime` 的一种具体形态，强调**隔离**。
+
+典型目标包括：
+
+- 不直接在宿主机无边界执行 Agent 生成的代码
+- 将文件系统、副作用、权限和依赖限制在一个可控环境里
+- 便于任务结束后回收环境，降低污染和风险
+
+所以可以简单理解为：
+
+- `runtime` = 执行环境这个总概念
+- `sandbox` = 带隔离边界的 runtime
+
+#### 什么是 E2B Sandbox
+
+`E2B sandbox` 是一种**云端托管的安全执行环境**。  
+它不是本地 Docker 容器本身，而是由 [E2B](https://e2b.dev) 提供的远程 sandbox，适合运行 AI 生成代码和 agent 任务。
+
+在这个目录下，`containers/e2b-sandbox/` 提供的是一个 E2B 模板定义，意味着未来可以：
+
+- 先把自定义 Dockerfile 构建成 E2B template
+- 再通过 Python 或 JS SDK 动态拉起远程 sandbox
+- 把 agent 的代码执行、命令执行、文件操作放进云端隔离环境里完成
+
+它和本地 runtime 的关系可以概括为：
+
+- `runtime` 是概念层：执行环境
+- `sandbox` 是实现形态：强调隔离
+- `E2B sandbox` 是具体后端：由 E2B 托管的远程隔离 runtime
+
+#### 为什么这层重要
+
+从架构上看，`containers/runtime` 和 `containers/e2b-sandbox` 的价值不在于“让模型更聪明”，而在于让系统更像一个真正可运行的 agent 平台：
+
+- 让代码执行从“宿主机直跑”升级为“在可控环境里跑”
+- 让不同机器上的依赖和执行行为更一致
+- 为每个任务、每个 team、甚至每个用户提供更强的隔离边界
+- 为未来的远程执行、多租户部署和资源配额管理打基础
+
+因此，在本仓库里，`containers/` 的重要性主要体现在**执行层与部署层**。  
+它不是当前 `v0.4.1` 的主路径核心，但它是框架从“单进程多 Agent 编排 demo”走向“可隔离执行的 agent 系统”的关键基础设施方向。
 
 ---
 

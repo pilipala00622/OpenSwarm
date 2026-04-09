@@ -444,6 +444,55 @@ result = await rollout.run(agent, "分析最新的 AI 发展趋势")
 
 ---
 
+### 与 Claude Managed Agents 的层级映射
+
+如果把 [Claude Managed Agents](https://claude.com/blog/claude-managed-agents) 看成一个**托管式 agent 平台**，那么当前仓库里的很多模块，在概念上都能映射到它的平台分层中。但两者的关键区别是：
+
+- `Claude Managed Agents` 偏 **平台产品**：Anthropic 托管 runtime、session、权限、追踪和一部分 orchestration harness
+- `agent-swarm` 偏 **自建框架**：开发者自己组装 agent、工具、任务编排、状态存储和运行时
+
+可以大致这样理解：
+
+| 当前仓库模块 | 在 Claude Managed Agents 中大致对应的平台层 | 说明 |
+| --- | --- | --- |
+| `Agent` / `AgentConfig` | Agent definition layer | 定义 agent 的角色、模型、prompt、能力边界 |
+| `MainRollout` / `SubRollout` | Orchestration harness | 负责 step loop、工具调用、完成检测、错误恢复等执行主循环 |
+| `TaskTool` / `CreateSubagentTool` | Multi-agent orchestration | 负责子 agent 拉起、任务拆分、并行执行与结果回收 |
+| `team_message` / `team_inbox` / `team_status` / `team_cleanup` | Coordination / collaboration layer | 对应多 agent 协作时的消息流、成员管理、状态可观测性 |
+| `TaskStore` / `TaskCreateTool` / `TaskUpdateTool` / `TaskClaimTool` | Task state / workflow state layer | 维护任务生命周期、依赖关系和 owner 状态 |
+| `BackgroundOutputTool` / `BackgroundCancelTool` | Long-running task control | 对应长任务执行中的后台运行、查询输出、取消与恢复控制 |
+| `search` / `verify_result` / `retrieve_context` | Tool + context layer | 对应平台中的工具接入层和上下文增强层 |
+| `KnowledgeEngine` / `retrieve_context` | Memory / retrieval augmentation | 更接近外部检索记忆层，而不是模型内部 memory 本身 |
+| `HandoffManager` / `HandoffTool` | Session handoff / checkpoint-like context transfer | 对应会话交接、上下文续接、任务快照传递 |
+| `result/output.jsonl` / `trace.jsonl` / tracing | Observability / tracing layer | 对应平台里的 session tracing、工具轨迹和问题排查能力 |
+| `containers/runtime` / `containers/e2b-sandbox` | Sandboxed execution runtime | 对应托管平台里的 secure sandbox / code execution layer |
+
+从这个角度看，当前仓库和 `Claude Managed Agents` 的关系不是“同一个东西换个名字”，而更像：
+
+- `agent-swarm`：自己搭建一套可实验、可扩展的 agent 系统
+- `Claude Managed Agents`：把其中大量基础设施做成云端托管能力
+
+因此，如果未来迁移到 `Claude Managed Agents`，通常**仍然会保留**的部分包括：
+
+- 业务任务定义
+- 自定义工具定义
+- 成功标准与评测逻辑
+- 面向用户的产品交互层
+
+而**可能被平台吸收或弱化**的部分包括：
+
+- 自己维护的 agent loop / rollout
+- 自己维护的 sandbox 生命周期
+- 自己维护的长会话状态管理
+- 自己维护的 tracing 与一部分权限治理
+
+一个实用判断标准是：
+
+- 如果你关心**研究灵活性、可控编排、benchmark 适配**，当前仓库这种自建框架更合适
+- 如果你关心**更快上线、少做 infra、生产托管能力**，`Claude Managed Agents` 更接近平台方案
+
+---
+
 ### 知识引擎层
 
 `KnowledgeEngine` 是新增的一层本地上下文基础设施，用来让 Agent 在执行任务前先拿到**更贴近代码结构的上下文**，而不是只依赖用户 prompt 或简单文本搜索。
